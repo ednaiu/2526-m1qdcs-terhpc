@@ -1,0 +1,13 @@
+gcc -O3 -march=native -mavx2 -mfma -fopenmp -Wall -Wextra -std=c11 -Iinclude -o bin/bench_sgemm bench/bench_sgemm.c src/sgemm.c -lopenblas -lm
+--- Running SGEMM Benchmark (single-thread) ---
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 bin/bench_sgemm
+# Single-threaded SGEMM benchmark
+# OMP_NUM_THREADS=1 recommended
+Size     Our_GFLOPS     OpenBLAS_GFLOPS Ratio     
+----     ----------     --------------- -----     
+64       25.58          39.72          0.644     
+128      36.16          53.09          0.681     
+256      43.54          62.67          0.695     
+512      50.72          72.50          0.700     
+1024     50.73          78.03          0.650     
+2048     45.12          73.23          0.616     
