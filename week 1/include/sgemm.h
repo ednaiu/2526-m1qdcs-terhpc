@@ -13,23 +13,31 @@
 #include <stddef.h>
 
 /* --------------------------------------------------------------------------
- * Micro-kernel tile sizes
- *   MR x NR  must fit in 16 YMM registers:
- *     NR accumulators  +  1 A-vector  +  1 B-broadcast  = NR + 2
- *   With MR=8 (1 YMM holds 8 floats) and NR=8 we need 10 regs → OK.
+ * Micro-kernel tile sizes — 6×16 for Haswell (16 YMM registers)
+ *
+ *   Register plan:
+ *     12 accumulators: 6 rows × 2 YMM (low 8 + high 8 cols)
+ *      2 B vectors:    B_lo[k,0..7], B_hi[k,8..15]
+ *      1 A broadcast:  one A[i,k] scalar
+ *      1 spare
+ *     = 16 total YMM registers
+ *
+ *   This gives 12 FMAs per k-step (vs 8 for 8×8).
  * -------------------------------------------------------------------------- */
-#define MR  8   /* rows processed by micro-kernel  (= 1 YMM width) */
-#define NR  8   /* cols processed by micro-kernel                   */
+#define MR  6       /* rows processed by micro-kernel               */
+#define NR  16      /* cols processed by micro-kernel (2 YMM widths)*/
 
 /* --------------------------------------------------------------------------
- * Cache-blocking tile sizes  (tune after inspecting lscpu on target machine)
- *   KC x MC  panel of A stays in L1 during micro-kernel sweep
- *   KC x NC  panel of B stays in L2
- *   MC, NC govern L3 reuse
+ * Cache-blocking tile sizes  (tuned for Haswell Xeon E5-2670 v3)
+ *   L1d = 32 KiB, L2 = 256 KiB, L3 = 25 MiB (shared)
+ *
+ *   MC × KC panel of A → fits in L2:  120 × 512 × 4B = 240 KiB ≤ 256 KiB
+ *   KC × NC panel of B → fits in L3:  512 × 4096 × 4B = 8 MiB ≤ 25 MiB
+ *   MR × KC micro-panel of A → fits in L1: 6 × 512 × 4B = 12 KiB ≤ 32 KiB
  * -------------------------------------------------------------------------- */
-#define MC  512     /* rows of A packed into L1/L2 slab   */
-#define KC  256     /* depth dimension packed into L2 slab */
-#define NC  4096    /* cols of B packed into L3 slab       */
+#define MC  120     /* rows of A packed into L2 (multiple of MR=6)  */
+#define KC  512     /* depth dimension packed into L2 slab           */
+#define NC  4096    /* cols of B packed into L3 slab                 */
 
 /* --------------------------------------------------------------------------
  * Public SGEMM interface

@@ -60,8 +60,8 @@ $(BINDIR)/test_sgemm: tests/test_sgemm.c $(SGEMM_SRC) | $(BINDIR)
 # Target 3: Performance benchmark vs OpenBLAS
 # -----------------------------------------------------------------------
 bench: $(BINDIR)/bench_sgemm
-	@echo "--- Running SGEMM Benchmark (single-thread) ---"
-	OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 $(BINDIR)/bench_sgemm
+	@echo "--- Running SGEMM Benchmark (16 threads) ---"
+	OMP_NUM_THREADS=16 OPENBLAS_NUM_THREADS=16 $(BINDIR)/bench_sgemm
 
 $(BINDIR)/bench_sgemm: bench/bench_sgemm.c $(SGEMM_SRC) | $(BINDIR)
 	$(CC) $(CFLAGS) $(IFLAGS) -o $@ $^ $(LIBS)
