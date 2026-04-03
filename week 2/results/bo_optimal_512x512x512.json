@@ -1,0 +1,18 @@
+{
+  "algorithm": "bayesian_optimization",
+  "problem_size": {
+    "M": 512,
+    "N": 512,
+    "K": 512
+  },
+  "kernel": "6x16",
+  "threads": 2,
+  "optimal_config": {
+    "MC": 120,
+    "KC": 512,
+    "NC": 4096
+  },
+  "best_gflops": 124.7789,
+  "total_evaluations": 8,
+  "wall_time_s": 0.49109339714050293
+}
