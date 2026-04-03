@@ -87,9 +87,8 @@ Three kernels were implemented:
 ### 4.4 Kernel 6×16 ASM (KERNEL_6x16_ASM)
 - Functionally identical to 6×16 but written in GCC inline x86-64 assembly
 - Bypasses the compiler entirely — guarantees exact register assignment and instruction ordering
-- Prevents compiler from inserting unneeded spills or reordering FMAs
-- In practice ~5–15% faster than the intrinsics version at large sizes
-
+- Prevents compiler from inserting unneeded spills or reordering FMAs (Compilers sometimes get "nervous" when all 16 registers are full. They might decide to temporarily save (spill) one register to the stack (memory) just to do a simple index calculation, then read it back. Memory is ~100x slower than registers. In ASM, you tell the CPU exactly which value stays in ymm0 through ymm15 for the entire loop, ensuring zero memory overhead.)
+- In practice ~5–15% faster than the intrinsics version at large sizes.
 All kernels accept: `(pA, pB, C_tile, K, alpha, beta, ldc)` and accumulate into the C tile in-place.
 
 ---
