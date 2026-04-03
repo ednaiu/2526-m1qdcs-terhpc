@@ -66,10 +66,11 @@ Generate generic multivariate performance auto-tuner for your kernels. The scrip
 - fetch tile, transpose, compute -> try to integrate transposition step into the GEMM itself to see if it improves performance.
 - in the load and store part: test non-temporal stores for C and integrate it if it improves performance (writes C matrix directly to memory since we don't need it in the cache anymore). We only need A and B in the cache as we reuse them.
 
-One of the important optimization techniques is prefetching; as the kernel is performing arithmetic operations on one tile, we can hint the processor to start loading the next tile into the cache. For this, the cache should be able to hold both existing and prefetched tiles simultaneously. Add this to your kernels and test the performance.
+- One of the important optimization techniques is prefetching; as the kernel is performing arithmetic operations on one tile, we can hint the processor to start loading the next tile into the cache. For this, the cache should be able to hold both existing and prefetched tiles simultaneously. Add this to your kernels and test the performance.
 
-So far, you have been generating and optimizing your kernels interactively with AI. Once you get the optimized implementation, it is preferable to have a complete implementation plan which allows us to generate this kernel from scratch with no a-priori conversation history with the AI. In other words, if you start a new project from scratch and give this implementation plan, AI should be able to generate a code that is as performant as your original implementation (or as close as possible).
+- So far, you have been generating and optimizing your kernels interactively with AI. Once you get the optimized implementation, it is preferable to have a complete implementation plan which allows us to generate this kernel from scratch with no a-priori conversation history with the AI. In other words, if you start a new project from scratch and give this implementation plan, AI should be able to generate a code that is as performant as your original implementation (or as close as possible).
 
+- Have the AI agent create agents themself so even this process is automated.
 
 
 ## Week 4: BLAS 1 kernels (only s???? type, excluding strided versions) (10/04)
