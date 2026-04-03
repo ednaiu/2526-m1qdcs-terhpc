@@ -47,6 +47,16 @@ Goals for the week
 
 ⇒ understand the code lmao (also how packing & prefetching works, what/how does micro-kernel compute)
 
+Oguz's version: Goals for the week
+
+Make your GEMM implementation compatible with the Goto-BLAS algorithm, which uses L3 cache to hold a tile of B, L2 cache to hold a tile of A, and uses L1 cache as a workspace to fetch smaller tiles of A and B to multiply.
+
+Generate three different micro-kernels (lets say 8x8, 16x6, 4x24), and make the algorithm work with these. Generate assembly versions for each kernel as well. Benchmark the performance in each case.
+
+Add a 2D task-based parallelization; computing each tile (i,j) of C becomes a task. Also add a 3D variant with a constant k where k tasks will cooperate for computing a single tile (i,j) of C (with appropriate dependencies and tile sum/reduction in the end). Compare the multithreaded performance of each case.
+
+Generate generic multivariate performance auto-tuner for your kernels. The script must call the kernel as a function f(x1, x2, x3, ...) where each variable corresponds to a tunable parameter of your kernel (cache tiles sizes or microkernel type for matrix multiplication, loop unrolling factor for example). It should then navigate this parameter search space to find a quasi-optimal parameter set which yields the best performance. Such task is called black-box optimization for which many algorithms exist. The script should be able to use Stochastic Bayesian Optimization andtwo other algorithms of your choice. Compare the performance of all three algorithms (in best performance obtained / number of kernel calls).
+
 ## Week 3: Tiled matrix multiplication (cont.) (03/04)
 
 - at each step -> review performance compared to previews steps, instead of just getting a final result at the end (include intermediary results from week 1 and week 2).
@@ -56,7 +66,26 @@ Goals for the week
 - fetch tile, transpose, compute -> try to integrate transposition step into the GEMM itself to see if it improves performance.
 - in the load and store part: test non-temporal stores for C and integrate it if it improves performance (writes C matrix directly to memory since we don't need it in the cache anymore). We only need A and B in the cache as we reuse them.
 
+Oguz's instructions:
+One of the important optimization techniques is prefetching; as the kernel is performing arithmetic operations on one tile, we can hint the processor to start loading the next tile into the cache. For this, the cache should be able to hold both existing and prefetched tiles simultaneously. Add this to your kernels and test the performance.
+
+So far, you have been generating and optimizing your kernels interactively with AI. Once you get the optimized implementation, it is preferable to have a complete implementation plan which allows us to generate this kernel from scratch with no a-priori conversation history with the AI. In other words, if you start a new project from scratch and give this implementation plan, AI should be able to generate a code that is as performant as your original implementation (or as close as possible).
+
+
+
 ## Week 4: BLAS 1 kernels (only s???? type, excluding strided versions) (10/04)
+
+Generate optimized AVX2 kernels for: sscal, scopy, sswap, saxpy, sdot, snrm2, sasum, isamax, srot.
+
+Add task-based parallelism as before.
+
+Aim to have a good implementation plan for one of the kernels, which should give a good baseline for other kernels since they all have similarities.
+
+You can assume incX and incY are both 1 for simplicity.
+
+Make sure the signature of all your function exactly follows Fortran BLAS signature (sscal(...)) as you will later put all these into a library that will replace OpenBLAS in benchmark tests.
+
+Create a tester that automatically generates many test cases for each kernel (including edge/patological cases) and tests them thoroughly, by comparing against OpenBLAS.
 
 ## Week 5: BLAS 2 kernels (only s???? type, excluding strided versions) (17/04)
 
