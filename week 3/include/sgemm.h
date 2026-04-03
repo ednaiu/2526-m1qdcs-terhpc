@@ -6,6 +6,9 @@
  *   A : M x K  (row-major, lda >= K)
  *   B : K x N  (row-major, ldb >= N)
  *   C : M x N  (row-major, ldc >= N)
+ *
+ * Week 3 additions:
+ *   - use_nt_store: non-temporal stores for C (bypass cache on write)
  */
 
 #ifndef SGEMM_H
@@ -66,6 +69,7 @@ typedef struct {
     kernel_type_t   kernel;
     parallel_mode_t parallel_mode;
     int r_tasks;     /* PARALLEL_3D only: K-replication factor (>= 1)         */
+    int use_nt_store;/* 1 = non-temporal stores for C (stream_ps); 0 = normal */
 } sgemm_config_t;
 
 /* Sensible defaults (6x16 kernel, 2D tasks, single thread until bench says otherwise) */
@@ -74,7 +78,8 @@ typedef struct {
     .nb_threads = 0, \
     .kernel = KERNEL_6x16, \
     .parallel_mode = PARALLEL_2D, \
-    .r_tasks = 1 \
+    .r_tasks = 1, \
+    .use_nt_store = 0 \
 }
 
 /* -----------------------------------------------------------------------
