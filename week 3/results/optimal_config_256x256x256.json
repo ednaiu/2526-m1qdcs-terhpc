@@ -1,0 +1,13 @@
+{
+  "problem_size": {
+    "M": 256,
+    "N": 256,
+    "K": 256
+  },
+  "optimal_config": {
+    "MC": 120,
+    "KC": 512,
+    "NC": 4096
+  },
+  "estimated_gflops": 64.0
+}
