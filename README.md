@@ -34,6 +34,19 @@ Goals for the week
 
 ## Week 2: Tiled matrix multiplication (cont.) (27/03)
 
+- micro-kernel : 3 possibilities, 8x8, 6x16, 4x24 → should be able to use whichever most efficient (?)
+- C++ intrinsics
+- assembly
+- diff execution time for diff sets of parameters (matrix size M k n, f(x1, x2, x3, x4, x5=nb_threads), micro-kernel size etc) → minimize execution time (auto-tuning), find optimal set of parameters for a given matrix size, compare with openBLAS performance for each specific case
+- diff algos: greater descent (random starting point, algo tries to find direction to update param, takes step in that direction. If start at bad place → stuck at local minimum : not ideal), stochastic bayesian optimisation (most common, better bc global), ask ai for alternatives, compare
+- n executions of kernel for each matrix size, then take median (not average !!) execution time (min and max not useful) → execution script should take care of this. keep deviation small, find optimal value of n : script starts with n = 3 (ex), computes min, max, median and avg, and standard deviation. if standard deviation > 2% n = n+1 (it will stop when standard deviation is small enough)
+- make as generic as possible so that it can be used for other kernels (later we will use same tool for other kernels like BLAS1, BLAS2 etc)
+- as usual compare w/ openBLAS
+- (TASK1 : basic) or multi-threaded parallelism: do task-based (better and easier): compute 1 tile of matrix C (mc x nc) (= 1 openMP task), total = M/nc x N/mc tasks. pb : small matrix  buty many cores → limited parallelism (not enough tasks to occupy all CPU cores) → 2nd version (TASK2 : 3D) : improve → r_task replication : instead of assigning computation of single task, assign r tasks/time. ex : r = 2 → 1st half of tiles multiplied by first task, 2nd half multiplied by 2nd task. task dependencies → partial results → reduction (merge together) → can add more parallelism to kernel ⇒ not limited by task parallelism (= 3D matrix multiplication)
+- ⇒ better to generate scripts in python (simpler, more readable)
+
+⇒ understand the code lmao (also how packing & prefetching works, what/how does micro-kernel compute)
+
 ## Week 3: Tiled matrix multiplication (cont.) (03/04)
 
 ## Week 4: BLAS 1 kernels (only s???? type, excluding strided versions) (10/04)
