@@ -49,9 +49,12 @@ Goals for the week
 
 ## Week 3: Tiled matrix multiplication (cont.) (03/04)
 
-- For a fixed matrix size: launch all 3 algos (autotuning: gradient descent, bayesian optimisation and annealing) and get graph: evaluation count on x-axis and on y-axis kernel performance. see for similar number of evaluations what performance we get. 
-- 
-
+- at each step -> review performance compared to previews steps, instead of just getting a final result at the end (include intermediary results from week 1 and week 2).
+- For a fixed matrix size: launch all 3 algos (autotuning: gradient descent, bayesian optimisation and annealing) and get graph: evaluation count on x-axis, and on y-axis kernel performance. see for similar number of evaluations what performance we get. 
+- Fix the 'known limitations' from the report in week 2 (no need to focus on Numa - too dirty).
+- loop-unrolling for micro-kernel.
+- fetch tile, transpose, compute -> try to integrate transposition step into the GEMM itself to see if it improves performance.
+- in the load and store part: test non-temporal stores for C and integrate it if it improves performance (writes C matrix directly to memory since we don't need it in the cache anymore). We only need A and B in the cache as we reuse them.
 
 ## Week 4: BLAS 1 kernels (only s???? type, excluding strided versions) (10/04)
 
