@@ -49,6 +49,10 @@ Goals for the week
 
 ## Week 3: Tiled matrix multiplication (cont.) (03/04)
 
+- For a fixed matrix size: launch all 3 algos (autotuning: gradient descent, bayesian optimisation and annealing) and get graph: evaluation count on x-axis and on y-axis kernel performance. see for similar number of evaluations what performance we get. 
+- 
+
+
 ## Week 4: BLAS 1 kernels (only s???? type, excluding strided versions) (10/04)
 
 ## Week 5: BLAS 2 kernels (only s???? type, excluding strided versions) (17/04)
