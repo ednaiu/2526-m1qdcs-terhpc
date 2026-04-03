@@ -24,6 +24,7 @@
 #define KERNEL_6X16_H
 
 #include <immintrin.h>
+#include <stdint.h>
 
 #define MR_6x16  6
 #define NR_6x16  16

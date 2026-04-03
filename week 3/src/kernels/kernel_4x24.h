@@ -23,6 +23,7 @@
 #define KERNEL_4X24_H
 
 #include <immintrin.h>
+#include <stdint.h>
 
 #define MR_4x24  4
 #define NR_4x24  24

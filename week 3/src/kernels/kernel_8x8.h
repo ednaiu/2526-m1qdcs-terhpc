@@ -21,6 +21,7 @@
 #define KERNEL_8X8_H
 
 #include <immintrin.h>
+#include <stdint.h>
 
 #define MR_8x8  8
 #define NR_8x8  8
