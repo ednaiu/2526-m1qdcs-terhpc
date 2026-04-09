@@ -86,12 +86,12 @@ void micro_kernel_6x16_asm(const float * __restrict__ pA,
      * pA stride per ×4 iteration: 4×MR×4 = 96 bytes
      * pB stride per ×4 iteration: 4×NR×4 = 256 bytes
      * ──────────────────────────────────────────────────────────────────── */
-    int k4 = k_len / 4;
-    int kr = k_len & 3;
 
     __asm__ volatile (
         /* ════════ ×4 MAIN LOOP ════════ */
-        "test   %[k4], %[k4]\n\t"
+        "movl   %[klen], %%eax\n\t"    /* copy k_len */
+        "shrl   $2, %%eax\n\t"         /* eax = k_len / 4 */
+        "test   %%eax, %%eax\n\t"
         "jz     3f\n\t"
         "1:\n\t"
 
@@ -185,7 +185,7 @@ void micro_kernel_6x16_asm(const float * __restrict__ pA,
 
         "add    $96,    %[pa]\n\t"      /* 4×MR×4 bytes */
         "add    $256,   %[pb]\n\t"      /* 4×NR×4 bytes */
-        "dec    %%rax\n\t"
+        "dec    %%eax\n\t"
         "jnz    1b\n\t"
         "3:\n\t"
 
@@ -231,7 +231,7 @@ void micro_kernel_6x16_asm(const float * __restrict__ pA,
           [klen] "+r" (k_len)
         : /* inputs — none beyond the above */
         : /* clobbers */
-          "rax", "ymm12", "ymm13", "ymm14", "memory"
+          "eax", "ymm12", "ymm13", "ymm14", "memory"
     );
 
     /* ── Store phase (C intrinsics, NT-aware) ─────────────────────────── */
