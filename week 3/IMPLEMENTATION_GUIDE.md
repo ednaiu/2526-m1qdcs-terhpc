@@ -1,8 +1,10 @@
-# SGEMM Optimization Library — Complete Implementation Specification
+# SGEMM AI Auto-Implementation System Prompt
 
-**Goal:** Implement a high-performance single-precision GEMM library for x86-64 AVX2+FMA.
-Computes `C = alpha * A * B + beta * C` where A is M×K, B is K×N, C is M×N, all row-major.
-Following this document in order produces a fully working, tested library matching Week 3 of the TER HPC project.
+**SYSTEM INSTRUCTION FOR AI AGENT:** 
+You are an expert AI software engineer specialized in high-performance computing (HPC) and C programming. 
+**Your task:** Implement a complete, highly optimized single-precision GEMM (SGEMM) library from scratch in this empty project. You MUST follow this exact architectural blueprint step-by-step without requiring user intervention. DO NOT prompt the user for follow-up guidance; proceed through all files, kernels, parallel thread structures, tests, and benchmarks automatically. When you finish, compile it with `make` and run the benchmarks.
+
+**Goal:** Implement `C = alpha * A * B + beta * C` where A is M×K, B is K×N, C is M×N, all row-major.
 
 ---
 
@@ -524,19 +526,31 @@ For each tile `(ic_idx, jc_idx)`, reduce `r` partial buffers into C:
 - `kr == 0`: `C_row[j] = beta*C_row[j] + partial_row[j]` (vectorized with `_mm256_fmadd_ps`, scalar tail)
 - `kr > 0`: `C_row[j] += partial_row[j]` (vectorized with `_mm256_add_ps`, scalar tail)
 
-### 7.6 `sgemm_ex`
+### 7.6 `sgemm_ex` (With Native VLA Small Matrix Bypass)
 
 ```c
 #define SMALL_MATRIX_OPS_THRESHOLD (128LL * 128 * 128)   // 2,097,152
 
+static void sgemm_small(...) {
+    // Avoid heap allocation overhread natively.
+    // Calculate required memory for M, N, K slices using MR and NR.
+    // Allocate C-compliant Variable Length Arrays (VLAs) locally:
+    // float pA_buf[pack_A_sz + 16]; 
+    // float pB_buf[pack_B_sz + 16];
+    // Align using: float *packed_A = (float *)(((uintptr_t)pA_buf + 63) & ~(uintptr_t)63);
+    // Proceed to pack B strips entirely into pB_buf.
+    // Proceed to pack A entirely into pA_buf.
+    // Call macro_kernel iteratively using a simple internal C loop. No OpenMP tasks.
+}
+
 void sgemm_ex(..., const sgemm_config_t *cfg) {
+    // 1. Check for small matrices to bypass thread instantiation via our VLA native stack handler
     if ((long long)M * N * K < SMALL_MATRIX_OPS_THRESHOLD) {
-        sgemm_config_t small_cfg = *cfg;
-        small_cfg.nb_threads = 1;
-        small_cfg.parallel_mode = PARALLEL_2D;
-        sgemm_task1(..., &small_cfg);
+        sgemm_small(...);
         return;
     }
+    
+    // 2. Otherwise run multi-threading branches
     if (cfg->parallel_mode == PARALLEL_3D)
         sgemm_task2(..., cfg);
     else
@@ -714,3 +728,8 @@ make all                      # must complete with 0 errors
 ```
 
 Tolerance for tests: relative `1e-3` (not `1e-6`) because single-precision FMA reordering causes non-associativity with the reference triple loop.
+
+---
+
+**FINAL INSTRUCTION FOR THE AI AGENT:** 
+Please begin implementation immediately without asking questions. Generate all the source files in their correct directory structures, populate the Makefiles and test suites, run compilation, execute the benchmarks, and output the final output log showing you correctly matched the `test_sgemm` checks and reached target OpenBLAS metrics in `bench_sgemm`.

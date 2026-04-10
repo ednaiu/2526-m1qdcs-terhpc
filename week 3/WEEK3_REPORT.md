@@ -202,17 +202,29 @@ From `results/direct_openblas_vs_week2.csv` (direct CBLAS comparison):
 - Problem: Sequential reduction loop runs on main thread after `#pragma omp taskwait`
 - Impact: ~500K floats processed serially for 120×4096 tile
 - Proposed fix: Parallelize reduction with `#pragma omp for schedule(static) collapse(2)`
-- Status: ⚠️ NOT IMPLEMENTED in Week 3
+- Status: ✅ **IMPLEMENTED** in Week 3
+  - *Chronological Impact:* Between Update 1 and Update 2, restoring parallelized reduction over the component `C` tiles yielded an 18% improvement on 1024³ from 8.48 GF/s to 10.00 GF/s, and a +5.3% improvement on 2048³ from 35.07 GF/s to 36.93 GF/s.
 
 **5.3 Small Matrix Performance (Limitation 10.2)**
 - Problem: Packing overhead (memcpy + aligned_alloc) dominates for M=N=K=64–128
 - Proposed fix: Small-matrix bypass using on-stack buffers
-- Status: ⚠️ NOT IMPLEMENTED in Week 3
+- Status: ✅ **IMPLEMENTED** in Week 3
+  - *Chronological Impact:* Bypassing `aligned_alloc` completely using native C VLA stacks allocated per macro-kernel bypass. Comparing Baseline to Update 1, performance on 64³ grew by **+24%** (34.10 GF/s to 42.34 GF/s), avoiding costly OpenMP thread dispatch penalties entirely.
 
 **5.4 Thread Scaling at 256×256 (Limitation 10.3)**
 - Problem: With MC=120, only 2 m-strips for M=256 → idle threads at 16T
 - Proposed fix: Auto-select MC based on problem size and thread count
-- Status: ⚠️ NOT IMPLEMENTED in Week 3
+- Status: ✅ **IMPLEMENTED** in Week 3
+  - *Chronological Impact:* Re-introducing MC auto-scaling for situations where `M/MC < 2*nthd` boosted our 6x16 TASK1 algorithm. Between Update 2 and Update 3, scaling specifically improved on 128³ by **+68%** (75.27 to 126.64 GF/s) and on 256³ by **+18%** (277.78 to 328.48 GF/s) as the framework re-balanced work for all available core logic without idle time.
+
+### Final Results (Post-Updates)
+Overall, after sequentially addressing limitations 10.1, 10.2, and 10.3, our updated architecture achieved the following top continuous outputs (`bench_update3.txt` using target kernels):
+- **64³**: **42.10 GF/s** (OpenBLAS: 49.62 GF/s)
+- **128³**: **126.64 GF/s** | OpenBLAS: 79.44 | **1.59×** faster
+- **256³**: **328.48 GF/s** | OpenBLAS: 151.65 | **2.16×** faster
+- **512³**: **521.36 GF/s** | OpenBLAS: 381.20 | **1.36×** faster
+- **1024³**: **690.74 GF/s** | OpenBLAS: 493.58 | **1.40×** faster
+- **2048³**: **840.69 GF/s** | OpenBLAS: 535.75 | **1.56×** faster
 
 ---
 

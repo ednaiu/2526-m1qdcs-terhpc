@@ -443,8 +443,42 @@ void sgemm_ref(int M, int N, int K,
         }
 }
 
-/* Matrices below this threshold get a 1-thread path: avoids OMP wakeup cost */
+/* Matrices below this threshold get a 1-thread path with on-stack buffers */
 #define SMALL_MATRIX_OPS_THRESHOLD (128LL * 128 * 128)
+
+static void sgemm_small(int M, int N, int K,
+                        float alpha, const float *A, int lda,
+                        const float *B, int ldb,
+                        float beta,  float *C, int ldc,
+                        const sgemm_config_t *cfg)
+{
+    int MR, NR;
+    kernel_get_mr_nr(cfg->kernel, &MR, &NR);
+    kernel_fn_t kfn = get_kernel_fn(cfg->kernel);
+
+    int A_strips_max = (M + MR - 1) / MR;
+    int B_strips_max = (N + NR - 1) / NR;
+    
+    size_t packed_A_sz = (size_t)A_strips_max * K * MR + 16;
+    size_t packed_B_sz = (size_t)B_strips_max * K * NR + 16;
+    
+    float pA_buf[packed_A_sz];
+    float pB_buf[packed_B_sz];
+    float *packed_A = (float *)(((uintptr_t)pA_buf + 63) & ~(uintptr_t)63);
+    float *packed_B = (float *)(((uintptr_t)pB_buf + 63) & ~(uintptr_t)63);
+
+    pack_A_panel(A, lda, packed_A, M, K, MR);
+    pack_B_strip(B, ldb, packed_B, K, N, NR, 0, B_strips_max);
+
+    for (int jt = 0; jt < B_strips_max; jt++) {
+        int N_curr = (jt * NR + NR <= N) ? NR : (N - jt * NR);
+        const float *pB_strip = packed_B + (size_t)jt * K * NR;
+
+        macro_kernel(packed_A, pB_strip, C + jt * NR,
+                     M, K, N_curr, MR, NR, alpha, beta, ldc, kfn,
+                     cfg->use_nt_store);
+    }
+}
 
 void sgemm_ex(int M, int N, int K,
               float alpha, const float *A, int lda,
@@ -453,10 +487,7 @@ void sgemm_ex(int M, int N, int K,
               const sgemm_config_t *cfg)
 {
     if ((long long)M * N * K < SMALL_MATRIX_OPS_THRESHOLD) {
-        sgemm_config_t small_cfg = *cfg;
-        small_cfg.nb_threads    = 1;
-        small_cfg.parallel_mode = PARALLEL_2D;
-        sgemm_task1(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, &small_cfg);
+        sgemm_small(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, cfg);
         return;
     }
 
