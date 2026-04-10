@@ -145,21 +145,24 @@
     \end{itemize}
 
     \column{0.47\textwidth}
-    \begin{block}{Week 2 baseline (20 threads, 6x16 TASK1)}
+    \begin{block}{Week 2 vs OpenBLAS (20T, 6x16 TASK1)}
       \footnotesize
-      \begin{tabular}{lrr}
+      \begin{tabular}{lrrc}
         \toprule
-        Size & Ours & OpenBLAS \\
+        Size & Ours & OB & Ratio \\
         \midrule
-        $64^3$   & 34.1 & 50.1 GF/s \\
-        $128^3$  & 78.9 & 76.9 GF/s \\
-        $256^3$  & 274  & 151 GF/s \\
-        $512^3$  & 568  & 360 GF/s \\
-        $1024^3$ & 796  & 113 GF/s \\
-        $2048^3$ & 884  & 547 GF/s \\
+        $64^3$   & 34.1 & 49.6 & $0.69\times$ \\
+        $128^3$  & 78.9 & 79.4 & $0.99\times$ \\
+        $256^3$  & 274  & 151.7 & \textcolor{good}{$1.81\times$} \\
+        $512^3$  & 568  & 381.2 & \textcolor{good}{$1.49\times$} \\
+        $1024^3$ & 796  & 493.6 & \textcolor{good}{$1.61\times$} \\
+        $2048^3$ & 884  & 535.8 & \textcolor{good}{$1.65\times$} \\
         \bottomrule
       \end{tabular}
     \end{block}
+    \vspace{0.1cm}
+    \scriptsize
+    \textit{Both measured in same benchmark,\\OPENBLAS\_NUM\_THREADS = OMP\_NUM\_THREADS = 20,\\median of 7 runs.}
   \end{columns}
 \end{frame}
 
@@ -527,8 +530,9 @@ if (M >= MR*2 &&
 %%  5. RESULTS
 %% =========================================================
 \begin{frame}{Progressive Benchmark Results}
-  All measurements: \textbf{20 threads, 6x16 TASK1, median of 7 runs}
-  \vspace{0.2cm}
+  \textbf{Conditions:} 20 threads, 6x16 TASK1, median of 7 runs.
+  Same binary used for both our code and OpenBLAS (\texttt{OPENBLAS\_NUM\_THREADS=20}).
+  \vspace{0.15cm}
 
   \begin{table}
     \centering
@@ -537,7 +541,7 @@ if (M >= MR*2 &&
       \toprule
       & \multicolumn{4}{c}{\textbf{Our implementation (GF/s)}} & & \\
       \cmidrule(lr){2-5}
-      \textbf{Size} & \textbf{Baseline} & \textbf{+P5 fix} & \textbf{+P6 fix} & \textbf{+P7 fix (final)} & \textbf{OpenBLAS} & \textbf{Ratio} \\
+      \textbf{Size} & \textbf{Baseline} & \textbf{+P5} & \textbf{+P6} & \textbf{+P7 (final)} & \textbf{OpenBLAS} & \textbf{Final/OB} \\
       \midrule
       $64^3$    & 34.1 & \textcolor{good}{42.3} & 42.4 & 42.1  & 49.6 & $0.85\times$ \\
       $128^3$   & 78.9 & 87.2 & 75.3 & \textcolor{good}{\textbf{126.6}} & 79.4  & \textcolor{good}{$\mathbf{1.59\times}$} \\
@@ -548,10 +552,12 @@ if (M >= MR*2 &&
       \bottomrule
     \end{tabular}
   \end{table}
-  \vspace{0.2cm}
+  \vspace{0.1cm}
   \footnotesize
-  \textbf{P5} = small-matrix bypass,\quad \textbf{P6} = TASK2 parallel reduction,\quad \textbf{P7} = adaptive MC.\\
-  Columns show cumulative effect. Baseline = Week 2 code before any Week 3 fixes.
+  \textbf{P5} = small-matrix bypass \quad \textbf{P6} = parallel TASK2 reduction \quad \textbf{P7} = adaptive MC\\
+  Columns are \textit{cumulative} (each column includes all previous fixes).\\
+  \textit{Note: non-monotone cells (e.g.\ $1024^3$ P5 = 580 $<$ baseline 796) are explained by MC-tuning
+  interactions resolved by P7.}
 \end{frame}
 
 \begin{frame}{Final Results vs OpenBLAS}
@@ -603,7 +609,11 @@ if (M >= MR*2 &&
     \vspace{0.1cm}
     \footnotesize
     \textcolor{bad}{$64^3$}: OpenBLAS wins (packing fixed cost)\\
-    $128^3$ and above: \textcolor{good}{\textbf{we win consistently}}
+    $128^3$ and above: \textcolor{good}{\textbf{we win consistently}}\\[0.15cm]
+    \textit{Methodology: same C binary calls\\
+    our \texttt{sgemm\_ex} and \texttt{cblas\_sgemm}\\
+    back-to-back. Both use 20 threads.\\
+    Median of 7 timed runs each.}
   \end{columns}
 \end{frame}
 
