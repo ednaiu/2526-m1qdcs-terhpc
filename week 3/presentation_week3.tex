@@ -24,7 +24,10 @@
   breaklines=true,
   keywordstyle=\color{accentblue}\bfseries,
   commentstyle=\color{gray},
-  language=C
+  language=C,
+  texcl=false,
+  mathescape=false,
+  literate={_}{\_}0
 }
 
 \title{SGEMM Optimization --- Week 3}
@@ -188,7 +191,7 @@
 %% =========================================================
 %%  3. SOLUTIONS: MICRO-KERNEL
 %% =========================================================
-\begin{frame}{Solution P1: Loop Unrolling x4}
+\begin{frame}[fragile]{Solution P1: Loop Unrolling x4}
   \begin{columns}
     \column{0.50\textwidth}
     \textbf{Problem:} x2 unrolling --- loop control every 2 steps.
@@ -229,7 +232,7 @@ for (; k <= k_len-4; k += 4) {
   \end{columns}
 \end{frame}
 
-\begin{frame}{Solution P2: Software Prefetching (Next Tile)}
+\begin{frame}[fragile]{Solution P2: Software Prefetching (Next Tile)}
   \begin{columns}
     \column{0.50\textwidth}
     \textbf{Problem:} after micro-kernel $(ir, jr)$ finishes, the CPU loads
@@ -275,7 +278,7 @@ for (; k <= k_len-4; k += 4) {
   \end{columns}
 \end{frame}
 
-\begin{frame}{Solution P3: Non-Temporal Stores for C}
+\begin{frame}[fragile]{Solution P3: Non-Temporal Stores for C}
   \begin{columns}
     \column{0.50\textwidth}
     \textbf{Problem:} \texttt{storeu\_ps} writes C through the cache hierarchy.
@@ -320,7 +323,7 @@ for (; k <= k_len-4; k += 4) {
   \end{columns}
 \end{frame}
 
-\begin{frame}{Solution P4: ASM Kernel --- GCC 30-Operand Limit}
+\begin{frame}[fragile]{Solution P4: ASM Kernel --- GCC 30-Operand Limit}
   \begin{columns}
     \column{0.52\textwidth}
     \textbf{Problem:} GCC inline asm has a hard limit of \textbf{30 operand slots}.
@@ -384,7 +387,7 @@ __asm__ volatile (
 %% =========================================================
 %%  4. SOLUTIONS: FRAMEWORK
 %% =========================================================
-\begin{frame}{Solution P5: Small-Matrix Bypass}
+\begin{frame}[fragile]{Solution P5: Small-Matrix Bypass}
   \begin{columns}
     \column{0.50\textwidth}
     \textbf{Problem:} for $M{=}N{=}K{=}64$, total work is $\approx 500$K FLOPs.
@@ -432,7 +435,7 @@ void sgemm_ex(..., cfg) {
   \end{columns}
 \end{frame}
 
-\begin{frame}{Solution P6: TASK2 Parallel Reduction}
+\begin{frame}[fragile]{Solution P6: TASK2 Parallel Reduction}
   \begin{columns}
     \column{0.50\textwidth}
     \textbf{Problem:} TASK2 splits K into $r$ slices; each task writes a
@@ -480,7 +483,7 @@ for (int ic = 0; ic < nr_ic; ic++) {
   \end{columns}
 \end{frame}
 
-\begin{frame}{Solution P7: Adaptive MC for Thread Balance}
+\begin{frame}[fragile]{Solution P7: Adaptive MC for Thread Balance}
   \begin{columns}
     \column{0.50\textwidth}
     \textbf{Problem:} $\lceil M/\text{MC} \rceil$ is the number of tiles in the
