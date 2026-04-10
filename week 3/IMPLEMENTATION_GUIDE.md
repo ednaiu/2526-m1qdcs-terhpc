@@ -1,532 +1,716 @@
-# SGEMM Optimization — From-Scratch Implementation Guide
+# SGEMM Optimization Library — Complete Implementation Specification
 
-**Purpose:** A complete specification allowing an AI (or developer) to regenerate the full
-optimized SGEMM kernel from zero, without any prior conversation history.
-
-**Target hardware:** x86-64 with AVX2 + FMA3 (Intel Haswell and later)  
-**Target FLOPS:** ~65 GFLOPS single-threaded at 1024³  
-**Language:** C99 + GCC inline assembly (x86-64 AT&T syntax)
+**Goal:** Implement a high-performance single-precision GEMM library for x86-64 AVX2+FMA.
+Computes `C = alpha * A * B + beta * C` where A is M×K, B is K×N, C is M×N, all row-major.
+Following this document in order produces a fully working, tested library matching Week 3 of the TER HPC project.
 
 ---
 
-## 1. Hardware Context
-
-### CPU characteristics (Intel Skylake/Cascade Lake, 20-core)
-
-| Parameter         | Value                              |
-|-------------------|------------------------------------|
-| SIMD width        | 256-bit (AVX2), 8 floats/register  |
-| YMM registers     | 16 (ymm0–ymm15)                    |
-| FMA throughput    | 2 FMA units, 1 FMA/cycle each = 16 FLOP/cycle |
-| L1 data cache     | 32 KB, 8-way, 64-byte cache lines  |
-| L2 cache          | 256 KB per core, 4-way             |
-| L3 cache          | ~25 MB shared                      |
-| Cache line size   | 64 bytes = 16 floats               |
-| Fill buffers      | ~12–16 per core                    |
-
-**Theoretical peak (single core):** `clock × 2 FMA × 8 floats × 2 ops/FMA`
-
-### Key constraints for GEMM
-
-- L1 holds ~8K floats. A micro-kernel's A panel + B panel must fit.
-- L2 holds the working set for an entire K-block column (KC × NR floats).
-- NT stores (`_mm256_stream_ps`) need 32-byte aligned addresses and require `_mm_sfence()` before cross-thread visibility.
-
----
-
-## 2. Algorithm: BLIS 5-Loop GEMM (GotoBLAS)
-
-The standard high-performance GEMM decomposition uses 5 nested loops to maximize cache reuse.
-From outermost to innermost:
+## 1. Project Structure
 
 ```
-for jc in 0..N step NC:          ← Loop 5 (L5): N-dimension strips
-  pack_B(B[0..K, jc..jc+NC])     ← pack B strip into Bp[NC/NR][K/KC][KC][NR]
-  for pc in 0..K step KC:         ← Loop 4 (L4): K-dimension blocks
-    for ic in 0..M step MC:       ← Loop 3 (L3): M-dimension panels
-      pack_A(A[ic..ic+MC, pc..pc+KC]) ← pack A panel into Ap[MC/MR][KC][MR]
-      for jr in 0..NC step NR:    ← Loop 2 (L2): micro-panel columns
-        for ir in 0..MC step MR:  ← Loop 1 (L1): micro-kernel rows
-          micro_kernel(pA, pB, C+ir*ldc+jr, KC, alpha, beta)
-```
-
-### Cache assignment
-
-| Data | Target cache | Layout after packing |
-|------|-------------|----------------------|
-| Micro-kernel A panel (MR × KC floats) | L1 | Row-major: `[KC][MR]` |
-| Micro-kernel B panel (KC × NR floats) | L1 | Row-major: `[KC][NR]` |
-| Full A macro-panel (MC × KC floats)   | L2 | Tiled: `[MC/MR][KC][MR]` |
-| Full B strip (KC × NC floats)         | L3 | Tiled: `[NC/NR][KC][NR]` |
-
-### Why packing is necessary
-
-Raw A and B have stride-lda row access patterns, causing cache misses in the micro-kernel inner loop. Packing creates contiguous memory layouts matched to SIMD access patterns, enabling sequential loads with hardware prefetch.
-
----
-
-## 3. Blocking Parameter Selection
-
-### Formula-based derivation
-
-**MR and NR** (micro-kernel tile dimensions):
-- Chosen so that MR + 2 YMM registers per k-step fits in 16 YMM total.
-- For 6×16: 12 accumulators (6 rows × 2 halves) + 2 B regs + 1 A broadcast = 15 YMM.
-- For 8×8: 8 accumulators + 1 B reg + 1 A broadcast = 10 YMM.
-- For 4×24: 12 accumulators (4 rows × 3 thirds) + 3 B regs + 1 A broadcast = 16 YMM.
-
-**KC** (K-block size): Sized so that A + B micro-panels fit in L1:
-```
-MR*KC*4 + NR*KC*4 <= L1_size * reuse_factor
-KC = L1_size * 0.5 / ((MR + NR) * 4)
-```
-For 6×16: KC ≈ 32768*0.5 / ((6+16)*4) = 186 → round to 256 (power of 2 friendly).
-
-**MC** (M-block size): Sized so that A macro-panel fits in L2:
-```
-MC*KC*4 <= L2_size * 0.8
-MC = 204800 / (KC * 4) = 200 (for KC=256) → round to 120 (multiple of MR=6)
-```
-
-**NC** (N-block size): Sized so that B strip fits in L3:
-```
-KC*NC*4 <= L3_size * 0.3
-NC = L3_size*0.3 / (KC*4) = ~9600 for KC=256, L3=25MB → use 3072 (multiple of NR=16)
-```
-
-### Default configuration
-```c
-MC = 120,  NC = 3072,  KC = 256,  MR = 6,  NR = 16   /* 6×16 kernel */
-MC = 64,   NC = 3072,  KC = 256,  MR = 8,  NR = 8    /* 8×8  kernel */
-MC = 64,   NC = 3072,  KC = 256,  MR = 4,  NR = 24   /* 4×24 kernel */
+project/
+  include/
+    sgemm.h              ← public API, enums, config struct
+  src/
+    sgemm.c              ← 5-loop framework, packing, parallelism
+    kernels/
+      kernel_8x8.h       ← 8×8  AVX2+FMA micro-kernel (C intrinsics)
+      kernel_6x16.h      ← 6×16 AVX2+FMA micro-kernel (C intrinsics)  ← default
+      kernel_4x24.h      ← 4×24 AVX2+FMA micro-kernel (C intrinsics)
+      kernel_6x16_asm.h  ← 6×16 micro-kernel (GCC inline x86-64 asm)
+  bench/
+    bench_sgemm.c        ← adaptive-N benchmarking tool
+  tests/
+    test_sgemm.c         ← correctness test suite
+  Makefile
 ```
 
 ---
 
-## 4. Packing Layout Specification
+## 2. Target Hardware
 
-### pack_A: A[M][K] → Ap[MC/MR][KC][MR]
-
-For each m-strip `(ic..ic+MC)`, for each k-block `(pc..pc+KC)`:
-```
-Ap[mi/MR * KC*MR + ki*MR + row_offset]
-  where mi = 0..MC, ki = 0..KC
-  row_offset = mi % MR
-```
-Access pattern: read A at `A[ic + mi][pc + ki]` with stride `lda`, write sequentially.
-
-**Edge handling:** If `MC_actual < MC` or `KC_actual < KC`, pad with zeros to maintain full panel size.
-
-### pack_B: B[K][N] → Bp[NC/NR][KC][NR]
-
-For each n-strip `(jc..jc+NC)`, for each k-block `(pc..pc+KC)`:
-```
-Bp[ni/NR * KC*NR + ki*NR + col_offset]
-  where ni = 0..NC, ki = 0..KC
-  col_offset = ni % NR
-```
-Access pattern: read B at `B[pc + ki][jc + ni]` with stride `ldb`, write sequentially.
+- Architecture: x86-64 with AVX2 and FMA3 (Intel Haswell/Skylake/Cascade Lake)
+- YMM registers: 16 total (ymm0–ymm15), each holds 8 single-precision floats (256-bit)
+- FMA units: 2 per core, 1 FMA/cycle each → 16 FLOP/cycle
+- L1 data cache: 32 KB, 8-way, 64-byte cache lines
+- L2 cache: 256 KB per core
+- L3 cache: ~25 MB shared
+- Fill buffers: ~12–16 (limits simultaneous outstanding prefetches)
+- Compiler: GCC with `-O3 -march=native -mavx -mavx2 -mfma -fopenmp`
 
 ---
 
-## 5. Micro-Kernel Design
+## 3. Public API — `include/sgemm.h`
 
-### 5.1 Register Plan (6×16 kernel)
+### 3.1 Kernel types enum
 
 ```
-ymm0  : accumulator row 0, cols 0–7    (acc0lo)
-ymm1  : accumulator row 0, cols 8–15   (acc0hi)
-ymm2  : accumulator row 1, cols 0–7    (acc1lo)
-ymm3  : accumulator row 1, cols 8–15   (acc1hi)
-...
-ymm10 : accumulator row 5, cols 0–7    (acc5lo)
-ymm11 : accumulator row 5, cols 8–15   (acc5hi)
-ymm12 : B vector, cols 0–7             (loaded each k-step)
-ymm13 : B vector, cols 8–15            (loaded each k-step)
-ymm14 : A broadcast scalar             (one float → all 8 lanes)
-ymm15 : unused / scratch
+typedef enum {
+    KERNEL_8x8      = 0,
+    KERNEL_6x16     = 1,   // default, highest utilization
+    KERNEL_4x24     = 2,
+    KERNEL_6x16_ASM = 3,
+} kernel_type_t;
 ```
 
-**FMA count per k-step:** 12 FMAs (6 rows × 2 B halves)  
-**FLOP per k-step:** 12 × 2 = 24  
-**FLOP per k-step (full 6×16 tile):** 6 × 16 × 2 = 192
+MR/NR per kernel:
 
-### 5.2 Single k-step pseudocode
+| Kernel | MR | NR | YMM accumulators | FMAs/k-step |
+|--------|----|----|-----------------|------------|
+| 8×8 | 8 | 8 | 8 | 8 |
+| 6×16 | 6 | 16 | 12 | 12 |
+| 4×24 | 4 | 24 | 12 | 12 |
+| 6×16_ASM | 6 | 16 | 12 | 12 |
+
+### 3.2 Parallelism mode enum
+
+```
+typedef enum {
+    PARALLEL_2D = 0,   // TASK1: 2D tile decomposition over M×N
+    PARALLEL_3D = 1,   // TASK2: K-replication with partial-C buffers
+} parallel_mode_t;
+```
+
+### 3.3 Configuration struct `sgemm_config_t`
+
+```
+typedef struct {
+    int MC;              // M-block, multiple of MR.  Default: 120
+    int KC;              // K-block.                  Default: 512
+    int NC;              // N-block, multiple of NR.  Default: 4096
+    int nb_threads;      // 0 = use OMP_NUM_THREADS.  Default: 0
+    kernel_type_t   kernel;         // Default: KERNEL_6x16
+    parallel_mode_t parallel_mode;  // Default: PARALLEL_2D
+    int r_tasks;         // K-replication factor (PARALLEL_3D). Default: 1
+    int use_nt_store;    // 1 = _mm256_stream_ps for C. Default: 0
+} sgemm_config_t;
+```
+
+Default initializer macro using C99 designated initializers:
+```
+#define SGEMM_DEFAULT_CONFIG { \
+    .MC=120, .KC=512, .NC=4096, .nb_threads=0, \
+    .kernel=KERNEL_6x16, .parallel_mode=PARALLEL_2D, \
+    .r_tasks=1, .use_nt_store=0 }
+```
+
+### 3.4 Helper inline function
+
+```
+static inline void kernel_get_mr_nr(kernel_type_t kt, int *mr, int *nr)
+```
+
+Switch on kt: KERNEL_8x8 → 8,8; KERNEL_6x16 and KERNEL_6x16_ASM → 6,16; KERNEL_4x24 → 4,24.
+
+### 3.5 Public functions
+
+```
+void sgemm_ref(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+void sgemm    (M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
+void sgemm_ex (M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, cfg);
+```
+
+All matrices row-major. A: M×K with stride lda≥K. B: K×N with stride ldb≥N. C: M×N with stride ldc≥N.
+
+---
+
+## 4. Packing Layout
+
+### 4.1 Why packing
+
+Raw A[M][K] and B[K][N] have row strides (lda, ldb) causing cache-line waste in the micro-kernel inner loop. Packing produces contiguous layouts that map directly to sequential SIMD loads.
+
+### 4.2 Packed A layout — `[nr_strips][KC][MR]`
+
+A panel covers rows `ic..ic+MC`, columns `pc..pc+KC`.
+`nr_strips = ceil(MC / MR)`.
+
+Strip `s` occupies bytes `s * KC * MR * 4` to `(s+1) * KC * MR * 4 - 1`.
+Within strip `s`, position `[k][r]` (k-step k, row-within-strip r) is at flat index `s*KC*MR + k*MR + r`.
+Source element: `A[(ic + s*MR + r) * lda + (pc + k)]`.
+
+Edge strip (last, if `MC % MR != 0`): rows beyond `m_curr` are padded with `0.0f`.
+
+### 4.3 Packed B layout — `[nr_tiles][KC][NR]`
+
+A strip covers columns `jc..jc+NC`, rows `pc..pc+KC`.
+`nr_tiles = ceil(NC / NR)`.
+
+Tile `t` occupies flat index `t*KC*NR + k*NR + c`.
+Source element: `B[(pc + k) * ldb + (jc + t*NR + c)]`.
+
+Fast path when `n_curr == NR` and `NR % 8 == 0`: copy 8 floats/iteration using `_mm256_loadu_ps` + `_mm256_store_ps`.
+
+Edge tile: columns beyond `n_curr` padded with `0.0f`.
+
+### 4.4 Function signatures
 
 ```c
-__m256 blo = _mm256_load_ps(pB);           // cols 0–7
-__m256 bhi = _mm256_load_ps(pB + 8);       // cols 8–15
-for (int row = 0; row < MR; row++) {
-    __m256 a = _mm256_broadcast_ss(pA + row);
-    acc[row][0] = _mm256_fmadd_ps(a, blo, acc[row][0]);
-    acc[row][1] = _mm256_fmadd_ps(a, bhi, acc[row][1]);
-}
-pA += MR;    // advance to next row of packed A
-pB += NR;    // advance to next row of packed B
+static void pack_A_panel(const float *A, int lda, float *packed,
+                         int M_blk, int K_blk, int MR);
+
+static void pack_B_strip(const float *B, int ldb, float *packed,
+                         int K_blk, int N_blk, int NR,
+                         int t_start, int t_end);
 ```
 
-### 5.3 K-loop structure (×4 unrolled)
-
-```c
-int k = 0;
-// Main loop: unrolled ×4 for reduced branch overhead
-for (; k <= k_len - 4; k += 4) {
-    // k+0: load blo0/bhi0, fmadd all rows
-    // k+1: load blo1/bhi1, fmadd all rows
-    // k+2: load blo2/bhi2, fmadd all rows
-    // k+3: load blo3/bhi3, fmadd all rows
-    pA += 4 * MR;
-    pB += 4 * NR;
-}
-// ×2 peel for k_len % 4 == 2 or 3
-for (; k <= k_len - 2; k += 2) { ... pA += 2*MR; pB += 2*NR; }
-// ×1 tail for k_len % 2 == 1
-for (; k < k_len; k++) { ... pA += MR; pB += NR; }
-```
-
-**Why ×4:** Gives the out-of-order engine a 4× larger instruction window to overlap
-FMA latency (4 cycles) with loads and pointer arithmetic. Empirically: 2–8% gain vs ×2.
-
-### 5.4 Store phase
-
-```c
-__m256 va = _mm256_set1_ps(alpha);
-__m256 vb = _mm256_set1_ps(beta);
-
-for (int row = 0; row < MR; row++) {
-    float *Cr = C + row * ldc;
-    __m256 existing_lo = _mm256_loadu_ps(Cr);
-    __m256 existing_hi = _mm256_loadu_ps(Cr + 8);
-    __m256 res_lo = _mm256_fmadd_ps(vb, existing_lo, _mm256_mul_ps(va, acc[row][0]));
-    __m256 res_hi = _mm256_fmadd_ps(vb, existing_hi, _mm256_mul_ps(va, acc[row][1]));
-
-    if (use_nt_store && ((uintptr_t)Cr % 32 == 0)) {
-        _mm256_stream_ps(Cr,     res_lo);   // NT store: bypass cache
-        _mm256_stream_ps(Cr + 8, res_hi);
-    } else {
-        _mm256_storeu_ps(Cr,     res_lo);
-        _mm256_storeu_ps(Cr + 8, res_hi);
-    }
-}
-```
-
-**NT stores:** Use `_mm256_stream_ps` when `use_nt_store=1` and address is 32-byte aligned.
-Bypasses L1/L2 on write, keeping cache free for A and B panels. Requires `_mm_sfence()` after
-all kernel calls in the caller to ensure memory ordering.
+`pack_B_strip` packs only tiles `[t_start, t_end)` — used for parallel packing
+where each thread packs a disjoint range of tiles.
 
 ---
 
-## 6. Software Prefetching
+## 5. Micro-Kernel Interface
 
-### 6.1 Motivation
-
-When the CPU finishes micro-kernel `(ir, jr)` and begins `(ir+1, jr)`, it must load a new
-A panel from L2 → L1. This takes ~10–15 cycles on a cache miss. Software prefetch during the
-previous kernel's k-loop hides this latency.
-
-### 6.2 Kernel signature extension
+### 5.1 Function pointer type
 
 ```c
 typedef void (*kernel_fn_t)(
-    const float *pA,        // current A panel (packed)
-    const float *pB,        // current B panel (packed)
-    float       *C,         // output tile (unpacked, row-major)
-    int          k_len,     // number of k-steps
+    const float *pA,        // packed A: [k_len][MR], 64-byte aligned
+    const float *pB,        // packed B: [k_len][NR], 64-byte aligned
+    float       *C,         // output tile, row-major, ldc stride
+    int          k_len,
     float        alpha,
     float        beta,
-    int          ldc,       // leading dimension of C
-    const float *next_A,    // start of NEXT A panel (for prefetch)
-    const float *next_B,    // start of NEXT B strip (for prefetch)
+    int          ldc,
+    const float *next_A,    // next A panel start — for prefetch only, never NULL
+    const float *next_B,    // next B strip start — for prefetch only, never NULL
     int          use_nt_store
 );
 ```
 
-### 6.3 Prefetch spread pattern
+### 5.2 Kernel semantics
 
-Issue one `_mm_prefetch` per cache line of the next tile, spread across k-iterations:
+Computes `C[i][j] = alpha * sum_k(pA[k][i] * pB[k][j]) + beta * C[i][j]` for i in 0..MR-1, j in 0..NR-1.
 
-```c
-const float *pfA = next_A;
-const float *pfB = next_B;
+Accumulators start at zero. All k-steps FMA into them. Final store: `result = alpha*acc + beta*existing_C`.
 
-for (; k <= k_len - 4; k += 4) {
-    // Each ×4 iter consumes 4×MR floats of A = 4×6×4=96 bytes = 2 CLs (6×16)
-    _mm_prefetch((const char *)pfA,      _MM_HINT_T0);
-    _mm_prefetch((const char *)(pfA+16), _MM_HINT_T0);
-    pfA += 4 * MR;
+`next_A` / `next_B` used only for `_mm_prefetch` — never dereferenced for computation.
+When the current strip is the last, caller passes the current `pA`/`pB` as dummy (harmless re-prefetch).
 
-    // B: 4×NR floats = 4×16×4=256 bytes = 4 CLs (6×16)
-    _mm_prefetch((const char *)pfB,      _MM_HINT_T0);
-    _mm_prefetch((const char *)(pfB+16), _MM_HINT_T0);
-    _mm_prefetch((const char *)(pfB+32), _MM_HINT_T0);
-    _mm_prefetch((const char *)(pfB+48), _MM_HINT_T0);
-    pfB += 4 * NR;
+### 5.3 Non-temporal store rule
 
-    /* ... FMA compute ... */
-}
+When `use_nt_store == 1` **and** `(uintptr_t)Cr % 32 == 0`:
+use `_mm256_stream_ps(Cr, result)`.
+Otherwise use `_mm256_storeu_ps(Cr, result)`.
+
+Caller must call `_mm_sfence()` after all kernel invocations that used NT stores.
+
+---
+
+## 6. Micro-Kernel Designs
+
+### 6.1 Common structure — all C-intrinsic kernels
+
+Every kernel follows this pattern:
+
+```
+1. Declare MR accumulator variables (or MR×ceil(NR/8) pairs), init to _mm256_setzero_ps()
+2. Declare prefetch pointers pfA = next_A, pfB = next_B
+3. k = 0
+4. Main loop: for (; k <= k_len-4; k += 4) {
+       issue prefetches for next tile (see per-kernel counts below)
+       advance pfA, pfB
+       process k+0, k+1, k+2, k+3 (each: load B vectors, broadcast A scalars, FMAs)
+       advance pA += 4*MR, pB += 4*NR
+   }
+5. Peel: for (; k <= k_len-2; k += 2) { process k+0 and k+1; pA+=2*MR; pB+=2*NR }
+6. Tail: for (; k < k_len; k++)       { process k+0; pA+=MR; pB+=NR }
+7. Scale: multiply each accumulator by alpha
+8. Store each row: load existing C, fmadd with beta, store (NT or regular)
 ```
 
-**Hint:** `_MM_HINT_T0` (L1). Use `_MM_HINT_T1` (L2) if KC > 512 to avoid L1 pollution.
+### 6.2 Kernel 8×8
 
-### 6.4 Caller: computing next_A and next_B
+**Accumulators:** `c0`–`c7` — one YMM per output row (covers all 8 cols).
 
-In `macro_kernel`, before calling the kernel function:
-```c
-int nr_m = (M_blk + MR - 1) / MR;   // number of m-strips in this panel
-const float *next_A = (it + 1 < nr_m)
-    ? pA_panel + (size_t)(it + 1) * K_blk * MR   // next strip
-    : pA;                                           // last strip → harmless re-prefetch
-const float *next_B = pB_strip;   // B doesn't change within macro_kernel
+**Per ×4 iteration prefetch:**
+- 2 CLs of next_A: `pfA+0` and `pfA+16` (each 64 bytes = 16 floats)
+- 2 CLs of next_B: `pfB+0` and `pfB+16`
+- Advance: `pfA += 4*8 = 32 floats`; `pfB += 4*8 = 32 floats`
 
-kfn(pA, pB_strip, Ctile, K_blk, alpha, beta_k, ldc, next_A, next_B, use_nt_store);
+**Per k-step body:**
+- Load `bvec = _mm256_load_ps(pB + k_offset * NR)`
+- For rows 0..7: `ci = _mm256_fmadd_ps(_mm256_broadcast_ss(pA + k_offset*MR + i), bvec, ci)`
+
+**Float offsets** in pA within one ×4 block (MR=8 → 8 floats per k-step):
+k+0: 0–7; k+1: 8–15; k+2: 16–23; k+3: 24–31.
+
+**Float offsets** in pB (NR=8 → 8 floats per k-step):
+k+0: 0–7; k+1: 8–15; k+2: 16–23; k+3: 24–31.
+
+**Store macro** per row: `Cr = C + row*ldc`, `res = beta*loadu(Cr) + alpha*ci`, NT/regular store.
+
+---
+
+### 6.3 Kernel 6×16 (default)
+
+**Accumulators:** `acc0lo`–`acc5lo` (cols 0–7) and `acc0hi`–`acc5hi` (cols 8–15). 12 total.
+
+**Per ×4 iteration prefetch:**
+- 2 CLs of next_A: `pfA+0`, `pfA+16` (96 bytes total advance: `pfA += 4*6 = 24 floats`)
+- 4 CLs of next_B: `pfB+0`, `pfB+16`, `pfB+32`, `pfB+48` (256 bytes total: `pfB += 4*16 = 64 floats`)
+
+**Per k-step body:**
+- `blo = _mm256_load_ps(pB + k_step*NR)`, `bhi = _mm256_load_ps(pB + k_step*NR + 8)`
+- For rows 0..5: `a = broadcast(pA + k_step*MR + row)`, then two FMAs: `accRlo += a*blo`, `accRhi += a*bhi`
+
+**Float offsets in pA within one ×4 block** (MR=6, 6 floats per k-step):
+
+| k-step | row 0 | row 1 | row 2 | row 3 | row 4 | row 5 |
+|--------|-------|-------|-------|-------|-------|-------|
+| k+0 | 0 | 1 | 2 | 3 | 4 | 5 |
+| k+1 | 6 | 7 | 8 | 9 | 10 | 11 |
+| k+2 | 12 | 13 | 14 | 15 | 16 | 17 |
+| k+3 | 18 | 19 | 20 | 21 | 22 | 23 |
+
+**Float offsets in pB within one ×4 block** (NR=16, 16 floats per k-step):
+
+| k-step | lo start | hi start |
+|--------|----------|----------|
+| k+0 | 0 | 8 |
+| k+1 | 16 | 24 |
+| k+2 | 32 | 40 |
+| k+3 | 48 | 56 |
+
+**Store phase:** scale all 12 accumulators by alpha first, then for each row:
+`Cr = C + row*ldc`; `res_lo = beta*loadu(Cr) + accRlo`; `res_hi = beta*loadu(Cr+8) + accRhi`; store.
+
+---
+
+### 6.4 Kernel 4×24
+
+**Accumulators:** `c00..c02` (row 0, three NR/8-wide thirds), `c10..c12`, `c20..c22`, `c30..c32`. 12 total.
+
+**Per ×4 iteration prefetch:**
+- 1 CL of next_A: `pfA+0` (64 bytes advance: `pfA += 4*4 = 16 floats`)
+- 6 CLs of next_B: `pfB+0`, `pfB+16`, `pfB+32`, `pfB+48`, `pfB+64`, `pfB+80` (384 bytes advance: `pfB += 4*24 = 96 floats`)
+
+**Per k-step body:**
+- `b0 = load(pB + k*24 + 0)`, `b1 = load(pB + k*24 + 8)`, `b2 = load(pB + k*24 + 16)`
+- For rows 0..3: `a = broadcast(pA + k*4 + row)`, then three FMAs: `cR0 += a*b0`, `cR1 += a*b1`, `cR2 += a*b2`
+
+**Float offsets in pA within one ×4 block** (MR=4, 4 floats per k-step):
+k+0: 0–3; k+1: 4–7; k+2: 8–11; k+3: 12–15.
+
+**Float offsets in pB within one ×4 block** (NR=24, 24 floats per k-step):
+
+| k-step | third 0 | third 1 | third 2 |
+|--------|---------|---------|---------|
+| k+0 | 0 | 8 | 16 |
+| k+1 | 24 | 32 | 40 |
+| k+2 | 48 | 56 | 64 |
+| k+3 | 72 | 80 | 88 |
+
+**Store phase:** same pattern as 6×16 but three stores per row at `Cr+0`, `Cr+8`, `Cr+16`.
+
+---
+
+### 6.5 Kernel 6×16 ASM
+
+Same arithmetic as kernel_6x16. The ×4 main loop body is in GCC inline x86-64 asm.
+
+**GCC inline asm 30-operand limit:**
+Each `"+x"` or `"+r"` bidirectional operand uses 2 slots. With 12 YMM accumulators + pA + pB + k4 = 15 bidirectional = 30 slots exactly. No room for next_A / next_B.
+
+**Solution:** issue prefetches in C *before* the asm block.
+
+**Pre-asm C code:**
 ```
+int k4 = k_len / 4;   // main loop count
+int kr = k_len & 3;   // remainder
 
-### 6.5 ASM kernel: prefetch before entering asm
-
-The GCC inline asm operand limit is 30 (each `+x`/`+r` counts as 2). With 12 accumulator
-registers + 3 pointer/counter registers, the budget is exactly full. To avoid exceeding it,
-issue the prefetches in C before the asm block:
-
-```c
-int k4 = k_len / 4;     // main loop iterations
-int kr = k_len & 3;     // remainder (0–3)
-
-// Pre-issue first 16 CLs of next_A and next_B
-size_t nA_bytes = (size_t)k_len * MR * sizeof(float);
-size_t nB_bytes = (size_t)k_len * NR * sizeof(float);
+// Issue first 16 CLs of next_A and next_B
 for (int cl = 0; cl < 16; cl++) {
     size_t off = (size_t)cl * 64;
-    if (off < nA_bytes) _mm_prefetch((const char *)next_A + off, _MM_HINT_T0);
-    if (off < nB_bytes) _mm_prefetch((const char *)next_B + off, _MM_HINT_T0);
+    if (off < (size_t)k_len * MR_6x16_ASM * 4)
+        _mm_prefetch((const char *)next_A + off, _MM_HINT_T0);
+    if (off < (size_t)k_len * NR_6x16_ASM * 4)
+        _mm_prefetch((const char *)next_B + off, _MM_HINT_T0);
 }
+```
 
-// ASM block with k4 as main loop counter; hardware prefetcher handles rest
-__asm__ volatile (
-    "test %[k4], %[k4]\n\t"
-    "jz   3f\n\t"
-    "1:\n\t"
-    /* ... 4 k-steps FMA ... */
-    "add $96,  %[pa]\n\t"    /* 4×MR×4 bytes for MR=6 */
-    "add $256, %[pb]\n\t"    /* 4×NR×4 bytes for NR=16 */
-    "dec %[k4]\n\t"
-    "jnz 1b\n\t"
-    "3:\n\t"
-    : [a0lo] "+x"(acc0lo), ..., [pa] "+r"(pA), [pb] "+r"(pB), [k4] "+r"(k4)
-    : : "ymm12", "ymm13", "ymm14", "memory"
-);
+**ASM block:**
 
-// C tail loop for remainder
-for (int k = 0; k < kr; k++) {
-    __m256 blo = _mm256_load_ps(pB);
-    __m256 bhi = _mm256_load_ps(pB + 8);
-    // broadcast each A element and fmadd
-    ...
-    pA += MR; pB += NR;
+Uses AT&T syntax. Operand names: `[a0lo]...[a5hi]` for 12 accumulators, `[pa]`, `[pb]`, `[k4]`.
+Clobbers: `"ymm12"`, `"ymm13"`, `"ymm14"`, `"memory"`.
+
+Loop structure:
+```asm
+test %[k4], %[k4]
+jz   end_label
+loop_label:
+  ; k+0
+  vmovaps    0(%[pb]),   ymm12    ; B lo
+  vmovaps   32(%[pb]),   ymm13    ; B hi
+  vbroadcastss  0(%[pa]), ymm14 ; A row 0
+  vfmadd231ps ymm14, ymm12, [a0lo]
+  vfmadd231ps ymm14, ymm13, [a0hi]
+  vbroadcastss  4(%[pa]), ymm14 ; A row 1
+  vfmadd231ps ymm14, ymm12, [a1lo]
+  vfmadd231ps ymm14, ymm13, [a1hi]
+  ... (rows 2–5 at byte offsets 8,12,16,20)
+
+  ; k+1  — pA offset +24 bytes, pB offset +64 bytes
+  vmovaps   64(%[pb]),   ymm12
+  vmovaps   96(%[pb]),   ymm13
+  vbroadcastss 24(%[pa]), ymm14   ; row 0 at k+1
+  ... (rows 1–5 at pa+28, pa+32, pa+36, pa+40, pa+44)
+
+  ; k+2  — pA+48, pB+128
+  vmovaps  128(%[pb]),   ymm12
+  vmovaps  160(%[pb]),   ymm13
+  ... (rows 0–5 at pa+48 through pa+68)
+
+  ; k+3  — pA+72, pB+192
+  vmovaps  192(%[pb]),   ymm12
+  vmovaps  224(%[pb]),   ymm13
+  ... (rows 0–5 at pa+72 through pa+92)
+
+  add $96,  %[pa]    ; 4×6×4 = 96 bytes
+  add $256, %[pb]    ; 4×16×4 = 256 bytes
+  dec %[k4]
+  jnz loop_label
+end_label:
+```
+
+**Full pA byte offset table for all rows and k-steps within one ×4 block** (MR=6):
+
+| | row 0 | row 1 | row 2 | row 3 | row 4 | row 5 |
+|-|-------|-------|-------|-------|-------|-------|
+| k+0 | 0 | 4 | 8 | 12 | 16 | 20 |
+| k+1 | 24 | 28 | 32 | 36 | 40 | 44 |
+| k+2 | 48 | 52 | 56 | 60 | 64 | 68 |
+| k+3 | 72 | 76 | 80 | 84 | 88 | 92 |
+
+**Full pB byte offset table** (NR=16, lo=cols 0–7, hi=cols 8–15):
+
+| | lo | hi |
+|-|----|-----|
+| k+0 | 0 | 32 |
+| k+1 | 64 | 96 |
+| k+2 | 128 | 160 |
+| k+3 | 192 | 224 |
+
+**Named operand constraint list:**
+```c
+: [a0lo] "+x"(acc0lo), [a0hi] "+x"(acc0hi),
+  [a1lo] "+x"(acc1lo), [a1hi] "+x"(acc1hi),
+  [a2lo] "+x"(acc2lo), [a2hi] "+x"(acc2hi),
+  [a3lo] "+x"(acc3lo), [a3hi] "+x"(acc3hi),
+  [a4lo] "+x"(acc4lo), [a4hi] "+x"(acc4hi),
+  [a5lo] "+x"(acc5lo), [a5hi] "+x"(acc5hi),
+  [pa]   "+r"(pA),
+  [pb]   "+r"(pB),
+  [k4]   "+r"(k4)
+: /* no pure inputs */
+: "ymm12", "ymm13", "ymm14", "memory"
+```
+
+**Post-asm C tail loop** for `kr` (0–3) remaining steps:
+Single k-step intrinsics body identical to kernel_6x16 ×1 tail, advancing `pA += MR`, `pB += NR` each iteration.
+
+**Store phase:** identical to kernel_6x16 (C intrinsics, alpha/beta, NT-store check).
+
+---
+
+## 7. Framework — `src/sgemm.c`
+
+### 7.1 Top of file
+
+```c
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <omp.h>
+#include <immintrin.h>
+#include "../include/sgemm.h"
+#include "kernels/kernel_8x8.h"
+#include "kernels/kernel_6x16.h"
+#include "kernels/kernel_4x24.h"
+#include "kernels/kernel_6x16_asm.h"
+```
+
+Define `kernel_fn_t` (Section 5.1). Implement `get_kernel_fn(kernel_type_t)` via switch.
+
+### 7.2 Packing functions
+
+Implement `pack_A_panel` and `pack_B_strip` as `static` functions per Section 4.
+
+### 7.3 `macro_kernel`
+
+```c
+static void macro_kernel(
+    const float *pA_panel, const float *pB_strip, float *C,
+    int M_blk, int K_blk, int N_curr, int MR, int NR,
+    float alpha, float beta_k, int ldc,
+    kernel_fn_t kfn, int use_nt_store)
+```
+
+`nr_m = ceil(M_blk / MR)`. Allocate `float C_buf[MR*NR]` on stack, 64-byte aligned.
+
+For each m-strip `it = 0..nr_m-1`:
+- `m_curr = min(MR, M_blk - it*MR)`
+- `pA = pA_panel + it * K_blk * MR`
+- `Ctile = C + it * MR * ldc`
+- `next_A = (it+1 < nr_m) ? pA_panel + (it+1)*K_blk*MR : pA`
+- `next_B = pB_strip`
+
+If `m_curr == MR && N_curr == NR`: call `kfn(pA, pB_strip, Ctile, K_blk, alpha, beta_k, ldc, next_A, next_B, use_nt_store)`.
+
+Else (edge tile):
+1. If `beta_k != 0`: copy `Ctile[0..m_curr-1][0..N_curr-1]` into `C_buf` (pad rest with 0)
+2. Else: `memset(C_buf, 0, MR*NR*sizeof(float))`
+3. Call `kfn(pA, pB_strip, C_buf, K_blk, alpha, beta_k, NR, next_A, next_B, 0)`
+4. Copy `C_buf[0..m_curr-1][0..N_curr-1]` back to `Ctile`
+
+After all strips: if `use_nt_store` call `_mm_sfence()`.
+
+### 7.4 `sgemm_task1` (PARALLEL_2D)
+
+```c
+static void sgemm_task1(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, cfg)
+```
+
+**Adaptive MC:**
+```c
+int MC = cfg->MC;
+if (M >= MR*2 && M/MC < nthd*2) {
+    MC = M / (nthd * 2);
+    MC = (MC / MR) * MR;
+    if (MC < MR) MC = MR;
+}
+```
+
+**Buffer allocation** (64-byte aligned):
+- `packed_A_all`: `nr_ic * ceil(MC/MR) * KC * MR` floats
+- `packed_B`: `ceil(NC/NR) * KC * NR` floats
+
+**Parallel region** `#pragma omp parallel num_threads(nthd)`:
+
+Outer loops `jc` (step NC) and `pc` (step KC) are sequential within the parallel region. `beta_k = (pc==0) ? beta : 1.0f`.
+
+Per `(jc, pc)`:
+1. `#pragma omp for schedule(static)` — parallel B tile packing
+2. `#pragma omp for schedule(static)` — parallel A panel packing
+3. `#pragma omp for collapse(2) schedule(dynamic)` — parallel macro_kernel calls
+
+### 7.5 `sgemm_task2` (PARALLEL_3D)
+
+```c
+static void sgemm_task2(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, cfg)
+```
+
+**Allocations:**
+- `partial_C[total_tiles * r]`: each entry is a `MC*NC` float buffer (64-byte aligned)
+- `thr_pA[nthd]` and `thr_pB[nthd]`: per-thread pack buffers
+
+**Phase 1** — `#pragma omp single` spawns tasks, then `#pragma omp taskwait`:
+
+For each `(ic_idx, jc_idx, kr)`:
+- Compute `pc_start = kr * ceil(ceil(K/KC)/r) * KC`, `pc_end = min(pc_start + ..., K)`
+- If `pc_start >= K`: zero the partial buffer and skip
+- `#pragma omp task firstprivate(...)`:
+  - `tid = omp_get_thread_num()`, use `thr_pA[tid]` / `thr_pB[tid]`
+  - Zero `pC_partial`
+  - Loop `pc` in `[pc_start, pc_end)` step KC: pack A, pack B, call `macro_kernel` per jt into `pC_partial + jt*NR` with `ldc=NC`
+
+The implicit barrier at the end of `omp single` ensures all tasks complete before Phase 2.
+
+**Phase 2** — `#pragma omp for collapse(2) schedule(static)`:
+
+For each tile `(ic_idx, jc_idx)`, reduce `r` partial buffers into C:
+- `kr == 0`: `C_row[j] = beta*C_row[j] + partial_row[j]` (vectorized with `_mm256_fmadd_ps`, scalar tail)
+- `kr > 0`: `C_row[j] += partial_row[j]` (vectorized with `_mm256_add_ps`, scalar tail)
+
+### 7.6 `sgemm_ex`
+
+```c
+#define SMALL_MATRIX_OPS_THRESHOLD (128LL * 128 * 128)   // 2,097,152
+
+void sgemm_ex(..., const sgemm_config_t *cfg) {
+    if ((long long)M * N * K < SMALL_MATRIX_OPS_THRESHOLD) {
+        sgemm_config_t small_cfg = *cfg;
+        small_cfg.nb_threads = 1;
+        small_cfg.parallel_mode = PARALLEL_2D;
+        sgemm_task1(..., &small_cfg);
+        return;
+    }
+    if (cfg->parallel_mode == PARALLEL_3D)
+        sgemm_task2(..., cfg);
+    else
+        sgemm_task1(..., cfg);
+}
+```
+
+### 7.7 `sgemm_ref`
+
+Triple loop: `for i, for j { s=0; for k s += A[i*lda+k]*B[k*ldb+j]; C[i*ldc+j] = alpha*s + beta*C[i*ldc+j]; }`.
+
+### 7.8 `sgemm`
+
+```c
+void sgemm(...) {
+    sgemm_config_t cfg = SGEMM_DEFAULT_CONFIG;
+    sgemm_ex(..., &cfg);
 }
 ```
 
 ---
 
-## 7. Parallelism Strategy
+## 8. Build System — `Makefile`
 
-### 7.1 TASK1: 2D Collapse (default, good for large matrices)
-
-```c
-#pragma omp parallel for collapse(2) schedule(dynamic, 1) num_threads(nthd)
-for (int jc = 0; jc < N; jc += NC)
-    for (int ic = 0; ic < M; ic += MC)
-        macro_kernel(ic, jc, ...);
-```
-
-Each iteration is one `MC × NC × KC` block. Dynamic scheduling balances load for
-non-square matrices. Works well when `M*N / (MC*NC) >> nthd`.
-
-### 7.2 TASK2: K-replication (for memory-bound small matrices)
-
-When `M*N` is small, TASK1 has few tiles and threads starve. TASK2 splits K into `r` slices,
-each thread computes a partial C, then reduces:
-
-```c
-// Phase 1: spawn tasks (one per ic×jc×pc combination)
-#pragma omp single
-{
-    for each (ic, jc, pc):
-        #pragma omp task
-            partial_C[task_id] += A[ic,pc] * B[pc,jc]
-    #pragma omp taskwait
-}
-
-// Phase 2: parallel reduction across K-slices
-#pragma omp for collapse(2) schedule(static)
-for (ic_tile ...) for (jc_tile ...):
-    C[tile] = sum_over_r(partial_C[r][tile])
-```
-
-### 7.3 Small-matrix bypass
-
-For `(long long)M*N*K < SMALL_MATRIX_OPS_THRESHOLD` (default: `128LL*128*128 = 2097152`),
-skip OpenMP and run single-threaded TASK1 to avoid parallel overhead:
-
-```c
-if ((long long)M * N * K < SMALL_MATRIX_OPS_THRESHOLD) {
-    // single-thread TASK1
-    macro_kernel(0, 0, ...);
-    return;
-}
-```
-
-### 7.4 Adaptive MC
-
-When `M / MC < nthd * 2`, there are fewer m-strips than 2× thread count → poor load balance.
-Auto-shrink MC:
-
-```c
-int effective_MC = cfg->MC;
-if (M >= MR * 2 && M / effective_MC < cfg->nb_threads * 2) {
-    effective_MC = M / (cfg->nb_threads * 2);
-    effective_MC = (effective_MC / MR) * MR;   // round down to MR multiple
-    if (effective_MC < MR) effective_MC = MR;  // never below 1 strip
-}
-```
-
----
-
-## 8. Complete Kernel Function Signature
-
-All kernels (8×8, 6×16, 4×24, 6×16-asm) share this signature:
-
-```c
-void micro_kernel_NAME(
-    const float * __restrict__ pA,      // packed A panel [k_len][MR]
-    const float * __restrict__ pB,      // packed B panel [k_len][NR]
-    float       * __restrict__ C,       // output, row-major, C[0..MR-1][0..NR-1]
-    int                        k_len,   // inner dimension (depth of tile)
-    float                      alpha,   // scalar α
-    float                      beta,    // scalar β  (0 = first K-block, 1 = accumulate)
-    int                        ldc,     // leading dimension of C (C stride between rows)
-    const float * __restrict__ next_A,  // prefetch hint: start of next A panel
-    const float * __restrict__ next_B,  // prefetch hint: start of next B panel
-    int                        use_nt_store  // 1 = _mm256_stream_ps for C output
-);
-```
-
-Function pointer type:
-```c
-typedef void (*kernel_fn_t)(const float *, const float *, float *,
-                             int, float, float, int,
-                             const float *, const float *, int);
-```
-
----
-
-## 9. GCC Inline ASM Operand Limit
-
-GCC limits inline asm to **30 operand slots** total. Each `"+x"` or `"+r"` bidirectional
-operand counts as **2** (one input slot + one output slot).
-
-Budget for 6×16-asm kernel:
-```
-12 accumulators × "+x" = 24 slots
- 3 registers    × "+r" = 6 slots   (pA, pB, k4)
-Total: 30 slots  ← exactly at limit
-```
-
-**Consequences:**
-- `next_A` and `next_B` cannot be asm operands → handled in C before asm.
-- The remainder loop (k_len % 4) cannot use a 4th `"+r"` operand → handled in C after asm
-  using `kr = k_len & 3` pre-computed before asm.
-- Scratch registers (e.g. `%%eax` for internal use) must be listed in the clobber list.
-
----
-
-## 10. Build System
-
-### Compiler flags
 ```makefile
+CC     = gcc
 CFLAGS = -O3 -march=native -fPIC -Wall -Wextra -fopenmp -mavx -mavx2 -mfma
+IFLAGS = -Iinclude
+LDFLAGS = -fopenmp -lm
+BIN    = bin
+
+all: $(BIN)/test_sgemm $(BIN)/bench_sgemm $(BIN)/simple_test
+
+$(BIN)/sgemm.o: src/sgemm.c include/sgemm.h src/kernels/*.h
+	$(CC) $(CFLAGS) $(IFLAGS) -c $< -o $@
+
+$(BIN)/test_sgemm: $(BIN)/sgemm.o tests/test_sgemm.c
+	$(CC) $(CFLAGS) $(IFLAGS) -c tests/test_sgemm.c -o $(BIN)/test_sgemm.o
+	$(CC) $(CFLAGS) $(IFLAGS) -o $@ $(BIN)/sgemm.o $(BIN)/test_sgemm.o $(LDFLAGS)
+
+$(BIN)/bench_sgemm: $(BIN)/sgemm.o bench/bench_sgemm.c
+	$(CC) $(CFLAGS) $(IFLAGS) -c bench/bench_sgemm.c -o $(BIN)/bench_sgemm.o
+	$(CC) $(CFLAGS) -o $@ $(BIN)/sgemm.o $(BIN)/bench_sgemm.o $(LDFLAGS)
+
+test: $(BIN)/test_sgemm
+	./$(BIN)/test_sgemm
+
+clean:
+	rm -f $(BIN)/*.o $(BIN)/test_sgemm $(BIN)/bench_sgemm $(BIN)/simple_test
 ```
 
-### Kernel selection
-The kernel to use is selected via `sgemm_config_t.kernel`:
+The `bin/` directory must exist. Add `$(shell mkdir -p $(BIN))` at top or a `.PHONY` prerequisite.
+
+---
+
+## 9. Test Suite — `tests/test_sgemm.c`
+
+### 9.1 Test matrix initialization
+
+Use a deterministic linear congruential generator to fill A, B, C with floats in `[-1, 1]`.
+Keep a separate copy of the initial C to pass to `sgemm_ref`.
+
+### 9.2 Comparison function
+
+For each element: `error = |result - ref|`. Pass if `error < 1e-3 * max(|ref|, 1e-4f)`.
+Print max observed error on failure.
+
+### 9.3 Test runner
+
+For each `(kernel, mode)` combination and each test case:
+1. Reset matrices to initial values
+2. Call `sgemm_ex` with the given config
+3. Reset to initial values; call `sgemm_ref`
+4. Compare; print `PASS` or `FAIL`
+
+End with `"===== ALL TESTS PASSED ====="` if no failures, else exit with code 1.
+
+### 9.4 Test cases
+
+16 cases per kernel/mode combination:
+
+| Name | M | N | K | alpha | beta |
+|------|---|---|---|-------|------|
+| square 8×8 | 8 | 8 | 8 | 1.0 | 0.0 |
+| square 16×16 | 16 | 16 | 16 | 1.0 | 0.0 |
+| square 32×32 | 32 | 32 | 32 | 1.0 | 0.0 |
+| square 64×64 | 64 | 64 | 64 | 1.0 | 0.0 |
+| square 128×128 | 128 | 128 | 128 | 1.0 | 0.0 |
+| square 256×256 | 256 | 256 | 256 | 1.0 | 0.0 |
+| square 512×512 | 512 | 512 | 512 | 1.0 | 0.0 |
+| 13×17×19 | 13 | 17 | 19 | 1.0 | 0.0 |
+| 33×33×33 | 33 | 33 | 33 | 1.0 | 0.0 |
+| 97×67×53 | 97 | 67 | 53 | 1.0 | 0.0 |
+| 100×200×300 | 100 | 200 | 300 | 1.0 | 0.0 |
+| alpha=2 beta=0.5 | 64 | 64 | 64 | 2.0 | 0.5 |
+| alpha=0 beta=1 | 64 | 64 | 64 | 0.0 | 1.0 |
+| tall 512×32×256 | 512 | 32 | 256 | 1.0 | 0.0 |
+| wide 32×512×256 | 32 | 512 | 256 | 1.0 | 0.0 |
+| thin-K 256×256×8 | 256 | 256 | 8 | 1.0 | 0.0 |
+
+### 9.5 Kernel/mode combinations
+
+All 4 kernels × PARALLEL_2D (r=1) + 4 kernels × PARALLEL_3D (r=4) = 8 combinations × 16 cases = 128 total.
+Print a `"-- kernel / mode --"` header before each group.
+
+---
+
+## 10. Benchmark — `bench/bench_sgemm.c`
+
+### 10.1 CLI argument parsing
+
+Parse `argc/argv` for: `--M`, `--N`, `--K`, `--kernel` (8x8|6x16|4x24|6x16asm), `--mode` (task1|task2), `--r`, `--threads`, `--runs`, `--nt-store`. Print usage and exit if unrecognized or required args missing.
+
+### 10.2 Adaptive run count
+
+If `--runs` not given: time one warm-up call with `omp_get_wtime()`, then set `runs = max(5, (int)ceil(1.0 / one_run_time))`.
+
+### 10.3 Measurement loop
+
 ```c
-typedef enum { KERNEL_8X8, KERNEL_6X16, KERNEL_4X24, KERNEL_6X16_ASM } kernel_type_t;
+for (int i = 0; i < runs; i++) {
+    t0 = omp_get_wtime();
+    sgemm_ex(M, N, K, 1.0f, A, K, B, N, 0.0f, C, N, &cfg);
+    times[i] = omp_get_wtime() - t0;
+}
 ```
 
-`sgemm_ex()` maps this to a function pointer and calls through `macro_kernel`.
+### 10.4 Statistics and output
 
-### Key files
-```
-include/sgemm.h                ← public API + sgemm_config_t definition
-src/sgemm.c                    ← 5-loop framework, packing, macro_kernel, task1/task2
-src/kernels/kernel_8x8.h       ← 8×8 AVX2+FMA micro-kernel (C intrinsics)
-src/kernels/kernel_6x16.h      ← 6×16 AVX2+FMA micro-kernel (C intrinsics)
-src/kernels/kernel_4x24.h      ← 4×24 AVX2+FMA micro-kernel (C intrinsics)
-src/kernels/kernel_6x16_asm.h  ← 6×16 micro-kernel (GCC inline x86-64 asm)
-bench/bench_sgemm.c            ← adaptive benchmark (--M --N --K --kernel flags)
-tests/test_sgemm.c             ← 96-case correctness test suite
+Sort `times[]`. Compute: median, mean, min, max, stddev, stddev%.
+GFLOPS = `2.0 * M * N * K / time / 1e9`.
+
+Print JSON with 9-decimal precision for times, 4-decimal for GFLOPS:
+```json
+{
+  "runs": N,
+  "median_s": X.XXXXXXXXX,
+  "mean_s":   X.XXXXXXXXX,
+  "min_s":    X.XXXXXXXXX,
+  "max_s":    X.XXXXXXXXX,
+  "stddev_s": X.XXXXXXXXX,
+  "stddev_pct": X.XXXX,
+  "gflops_median": X.XXXX,
+  "gflops_mean":   X.XXXX,
+  "gflops_min":    X.XXXX,
+  "gflops_max":    X.XXXX,
+  "all_times": [t0, t1, ...]
+}
 ```
 
 ---
 
-## 11. Validation Checklist
+## 11. Expected Performance
 
-After any kernel modification, run:
+Measured on Intel ~3.5 GHz, 1 thread:
+
+| Size | 6×16 C | 6×16 ASM | Notes |
+|------|--------|----------|-------|
+| 256³ | ~55 GFLOPS | ~55 GFLOPS | fits in L2 |
+| 512³ | ~63 GFLOPS | ~63 GFLOPS | fits in L3 |
+| 1024³ | ~65 GFLOPS | ~65 GFLOPS | peak |
+| 2048³ | ~60 GFLOPS | ~60 GFLOPS | L3 bandwidth bound |
+
+~58% of theoretical peak is normal for GEMM. ASM and C intrinsic kernels reach identical GFLOPS (GCC optimizer is effective at this pattern).
+
+---
+
+## 12. Validation
 
 ```bash
-make test        # builds test binary and executes it
-./bin/test_sgemm # must print "ALL TESTS PASSED"
+make all                      # must complete with 0 errors
+./bin/test_sgemm              # must print "===== ALL TESTS PASSED ====="
+./bin/bench_sgemm --M 1024 --N 1024 --K 1024 --kernel 6x16
+# expect: gflops_median > 50, stddev_pct < 5
 ```
 
-The test suite covers:
-- Square matrices: 8×8 through 512×512
-- Odd sizes: 13×17×19, 33×33×33, 97×67×53
-- Non-square: 100×200×300
-- Non-trivial scalars: α=2, β=0.5
-- Zero-alpha: α=0, β=1 (C unchanged)
-- Tall: 512×32×256
-- Wide: 32×512×256
-- Thin-K: 256×256×8
-- All four kernel types (8×8, 6×16, 4×24, 6×16-asm)
-- Both TASK1 and TASK2 parallelism modes
-
-**Tolerance:** `|result - reference| / |reference| < 1e-4` (relative), or `< 1e-4` absolute
-for near-zero values. Computed via OpenMP-parallelized reference GEMM.
-
----
-
-## 12. Benchmarking Protocol
-
-```bash
-./bin/bench_sgemm --M 1024 --N 1024 --K 1024 --kernel 6x16asm
-```
-
-Output: JSON with median GFLOPS, stddev%, min/max times.  
-**Target:** stddev < 5% (< 2% ideal). If higher, increase `--runs` or check thermal throttling.
-
-**Performance reference points (single socket, ~3.5 GHz, 1 thread):**
-- 8×8: ~60 GFLOPS at 1024³
-- 6×16: ~65 GFLOPS at 1024³
-- 4×24: ~62 GFLOPS at 1024³
-- 6×16-asm: ~65 GFLOPS at 1024³ (matches C intrinsics; compiler is effective)
-
----
-
-## 13. Step-by-Step Reconstruction Order
-
-To build this implementation from scratch:
-
-1. **Baseline:** scalar GEMM with triple loop
-2. **AVX2 micro-kernel (no packing):** hard-code `pA` stride = `lda`, `pB` stride = `ldb`
-3. **Packing:** implement `pack_A` and `pack_B`, verify correctness
-4. **5-loop framework:** add L3/L2/L1 blocking loops around micro-kernel
-5. **×2 unrolling:** manually unroll k-loop
-6. **×4 unrolling:** extend to 4 steps; add ×2 peel + ×1 tail
-7. **Software prefetch:** add `next_A`/`next_B` params; spread prefetches across k-loop
-8. **NT stores:** add `use_nt_store` flag; `_mm256_stream_ps` + alignment check
-9. **OpenMP TASK1:** `#pragma omp parallel for collapse(2) schedule(dynamic)`
-10. **OpenMP TASK2:** K-replication with task-parallel reduction
-11. **Small-matrix bypass:** threshold at M*N*K < 128³
-12. **Adaptive MC:** shrink when M/MC < 2*nthd
-13. **ASM kernel:** rewrite ×4 loop in GCC inline asm; keep pre/post in C (operand limit)
-
-At each step: `make test` must pass, `make bench` should show monotone improvement.
+Tolerance for tests: relative `1e-3` (not `1e-6`) because single-precision FMA reordering causes non-associativity with the reference triple loop.
