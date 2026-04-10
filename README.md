@@ -87,6 +87,10 @@ Make sure the signature of all your function exactly follows Fortran BLAS signat
 
 Create a tester that automatically generates many test cases for each kernel (including edge/patological cases) and tests them thoroughly, by comparing against OpenBLAS.
 
+FOR RESULTS: always compare with the best results on each size (ex: what percentage of best results did we reach?). Always keep OPENBLAS comparison in results table. Have intermediate results FOR EVERY SINGLE LITTLE TWEAK.
+
+FOR THE IMPLEMENTATION PLAN: Have an AI agent generate a new agent and loop over the plan to keep improving on its results, setting a performance-goal to reach (or max number of iterations). the master AI agent compares results of the new agent with our results and decide to continue looping or stop. Then generate a report.
+
 ## Week 5: BLAS 2 kernels (only s???? type, excluding strided versions) (17/04)
 
 ## Week 6: Other BLAS 3 kernels (trsm, syrk, trmm) (tentative) (24/04)
