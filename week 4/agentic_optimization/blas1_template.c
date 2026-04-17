@@ -9,7 +9,7 @@
 #include <omp.h>
 #include "../include/blas1.h"
 
-#define PREFETCH_DIST 0
+#define PREFETCH_DIST {{PREFETCH_DIST}}
 
 static inline float hsum256(__m256 v) {
     __m128 lo  = _mm256_castps256_ps128(v);
@@ -69,16 +69,13 @@ void saxpy_avx2(int n, float alpha, const float *x, float *y)
     if (alpha == 0.0f) return;
     __m256 va = _mm256_set1_ps(alpha);
     int i = 0;
-    int unroll = 1;
+    int unroll = {{UNROLL_FACTOR}};
     int step = unroll * 8;
     for (; i <= n - step; i += step) {
-        
-                __m256 vx0 = _mm256_loadu_ps(x + i + 0);
-        __m256 vy0 = _mm256_loadu_ps(y + i + 0);
-        _mm256_storeu_ps(y + i + 0, _mm256_fmadd_ps(va, vx0, vy0));
-
+        {{PREFETCH_LOGIC}}
+        {{LOOP_BODY}}
     }
-    
+    {{SFENCE}}
     for (; i < n; i++) y[i] += alpha * x[i];
 }
 void saxpy(int n, float alpha, const float *x, float *y) { saxpy_avx2(n, alpha, x, y); }
