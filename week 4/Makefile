@@ -1,4 +1,4 @@
-# Makefile for Week 2: SGEMM with multiple kernels and autotuning
+# Makefile for Week 4: SGEMM (Week 3) + BLAS 1 kernels
 
 # Compiler and flags
 CC        := gcc
@@ -20,24 +20,32 @@ AUTO_DIR  := autotuning
 RES_DIR   := results
 
 # Source files
-KERN_SRCS := $(wildcard $(SRC_DIR)/kernels/*.h)
-SGEMM_SRC := $(SRC_DIR)/sgemm.c
-BENCH_SRC := $(BENCH_DIR)/bench_sgemm.c
-CMP_SRC   := $(BENCH_DIR)/compare_direct_openblas.c
-TEST_SRC  := $(TEST_DIR)/test_sgemm.c
+KERN_SRCS   := $(wildcard $(SRC_DIR)/kernels/*.h)
+SGEMM_SRC   := $(SRC_DIR)/sgemm.c
+BLAS1_SRC   := $(SRC_DIR)/blas1.c
+BENCH_SRC   := $(BENCH_DIR)/bench_sgemm.c
+BENCH1_SRC  := $(BENCH_DIR)/bench_blas1.c
+CMP_SRC     := $(BENCH_DIR)/compare_direct_openblas.c
+TEST_SRC    := $(TEST_DIR)/test_sgemm.c
+TEST1_SRC   := $(TEST_DIR)/test_blas1.c
 
 # Object files
-SGEMM_OBJ := $(BIN_DIR)/sgemm.o
-BENCH_OBJ := $(BIN_DIR)/bench_sgemm.o
+SGEMM_OBJ  := $(BIN_DIR)/sgemm.o
+BLAS1_OBJ  := $(BIN_DIR)/blas1.o
+BENCH_OBJ  := $(BIN_DIR)/bench_sgemm.o
 
 # Binaries
-BENCH_BIN := $(BIN_DIR)/bench_sgemm
-TEST_BIN  := $(BIN_DIR)/test_sgemm
-CMP_BIN   := $(BIN_DIR)/compare_direct_openblas
+BENCH_BIN  := $(BIN_DIR)/bench_sgemm
+TEST_BIN   := $(BIN_DIR)/test_sgemm
+CMP_BIN    := $(BIN_DIR)/compare_direct_openblas
 SIMPLE_BIN := $(BIN_DIR)/simple_test
+TEST1_BIN  := $(BIN_DIR)/test_blas1
+BENCH1_BIN := $(BIN_DIR)/bench_blas1
+LIBBLAS1   := $(BIN_DIR)/libblas1.a
 
 # Targets
-.PHONY: all clean bench test compare simple-test \
+.PHONY: all all-blas1 clean bench test compare simple-test \
+        blas1 test-blas1 bench-blas1 run-blas1-test run-blas1-bench \
         run-bench run-test run-simple run-compare run-all \
         help check-compiler
 
@@ -121,12 +129,40 @@ $(BIN_DIR)/simple_test.o: $(TEST_DIR)/simple_test.c $(INC_DIR)/sgemm.h | $(BIN_D
 $(SIMPLE_BIN): $(SGEMM_OBJ) $(BIN_DIR)/simple_test.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
+# BLAS 1 object
+$(BLAS1_OBJ): $(BLAS1_SRC) $(INC_DIR)/blas1.h | $(BIN_DIR)
+	$(CC) $(CFLAGS) -I$(INC_DIR) -c $(BLAS1_SRC) -o $@
+
+# BLAS 1 test binary
+$(BIN_DIR)/test_blas1.o: $(TEST1_SRC) $(INC_DIR)/blas1.h | $(BIN_DIR)
+	$(CC) $(CFLAGS) $(OPENBLAS_CFLAGS) -I$(INC_DIR) -c $(TEST1_SRC) -o $@
+
+$(TEST1_BIN): $(BLAS1_OBJ) $(BIN_DIR)/test_blas1.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(OPENBLAS_LDFLAGS)
+
+# BLAS 1 benchmark binary
+$(BIN_DIR)/bench_blas1.o: $(BENCH1_SRC) $(INC_DIR)/blas1.h | $(BIN_DIR)
+	$(CC) $(CFLAGS) $(OPENBLAS_CFLAGS) -I$(INC_DIR) -c $(BENCH1_SRC) -o $@
+
+$(BENCH1_BIN): $(BLAS1_OBJ) $(BIN_DIR)/bench_blas1.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(OPENBLAS_LDFLAGS)
+
+# BLAS 1 Static Library
+$(LIBBLAS1): $(BLAS1_OBJ)
+	@echo "Creating static library $@"
+	ar rcs $@ $^
+
 # Convenience targets
 bench: $(BENCH_BIN)
 bench-ob: $(BIN_DIR)/bench_sgemm_ob
 test: $(TEST_BIN)
 compare: $(CMP_BIN)
 simple-test: $(SIMPLE_BIN)
+blas1: $(BLAS1_OBJ)
+test-blas1: $(TEST1_BIN)
+bench-blas1: $(BENCH1_BIN)
+lib-blas1: $(LIBBLAS1)
+all-blas1: $(TEST1_BIN) $(BENCH1_BIN) $(LIBBLAS1)
 
 # Run targets
 run-bench: $(BIN_DIR)/bench_sgemm_ob | $(RES_DIR)
@@ -146,7 +182,16 @@ run-compare: $(CMP_BIN)
 	@echo "Running direct OpenBLAS comparison..."
 	@./$(CMP_BIN) 5
 
-run-all: run-simple run-bench
+run-blas1-test: $(TEST1_BIN)
+	@echo "Running BLAS 1 correctness tests..."
+	@./$(TEST1_BIN)
+
+run-blas1-bench: $(BENCH1_BIN) | $(RES_DIR)
+	@echo "Running BLAS 1 benchmarks (OMP_NUM_THREADS=$(OMP_NUM_THREADS))..."
+	@OMP_NUM_THREADS=$${OMP_NUM_THREADS:-8} ./$(BENCH1_BIN) \
+	    | tee $(RES_DIR)/blas1_bench_$$(date +%Y%m%d_%H%M%S).txt
+
+run-all: run-simple run-bench run-blas1-test
 	@echo "All tests and benchmarks completed."
 
 # Clean build artifacts

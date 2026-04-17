@@ -130,25 +130,19 @@ int main(void)
         const char      *name;
         sgemm_config_t   cfg;
     } kernels[] = {
-        { "8x8  / TASK1",
-          { .MC=128, .KC=512, .NC=512,  .nb_threads=1,
-            .kernel=KERNEL_8x8,  .parallel_mode=PARALLEL_2D, .r_tasks=1 } },
-        { "6x16 / TASK1",
-          { .MC=120, .KC=512, .NC=4096, .nb_threads=1,
-            .kernel=KERNEL_6x16, .parallel_mode=PARALLEL_2D, .r_tasks=1 } },
-        { "4x24 / TASK1",
-          { .MC=120, .KC=512, .NC=4080, .nb_threads=1,
-            .kernel=KERNEL_4x24, .parallel_mode=PARALLEL_2D, .r_tasks=1 } },
-        { "6x16-asm / TASK1",
-          { .MC=120, .KC=512, .NC=4096, .nb_threads=1,
-            .kernel=KERNEL_6x16_ASM, .parallel_mode=PARALLEL_2D, .r_tasks=1 } },
+        { "6x16 / TASK1 [LOOP]",
+          { .MC=120, .KC=512, .NC=4096, .nb_threads=4,
+            .kernel=KERNEL_6x16, .parallel_mode=PARALLEL_2D, .sched_mode=SCHED_LOOP, .r_tasks=1 } },
+        { "6x16 / TASK1 [TASK]",
+          { .MC=120, .KC=512, .NC=4096, .nb_threads=4,
+            .kernel=KERNEL_6x16, .parallel_mode=PARALLEL_2D, .sched_mode=SCHED_TASK, .r_tasks=1 } },
         /* TASK2 */
-        { "6x16 / TASK2 r=2",
-          { .MC=120, .KC=512, .NC=512,  .nb_threads=2,
-            .kernel=KERNEL_6x16, .parallel_mode=PARALLEL_3D, .r_tasks=2 } },
-        { "6x16 / TASK2 r=4",
+        { "6x16 / TASK2 [LOOP]",
           { .MC=120, .KC=512, .NC=512,  .nb_threads=4,
-            .kernel=KERNEL_6x16, .parallel_mode=PARALLEL_3D, .r_tasks=4 } },
+            .kernel=KERNEL_6x16, .parallel_mode=PARALLEL_3D, .sched_mode=SCHED_LOOP, .r_tasks=4 } },
+        { "6x16 / TASK2 [TASK]",
+          { .MC=120, .KC=512, .NC=512,  .nb_threads=4,
+            .kernel=KERNEL_6x16, .parallel_mode=PARALLEL_3D, .sched_mode=SCHED_TASK, .r_tasks=4 } },
     };
 
     for (int i = 0; i < (int)(sizeof kernels / sizeof kernels[0]); i++) {

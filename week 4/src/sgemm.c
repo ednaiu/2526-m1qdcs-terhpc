@@ -229,21 +229,45 @@ static void sgemm_task1(int M, int N, int K,
                     pack_A_panel(A + ic * lda + pc, lda, pA_panel, M_blk, K_blk, MR);
                 }
 
-                #pragma omp for collapse(2) schedule(dynamic)
-                for (int ic_idx = 0; ic_idx < nr_ic; ic_idx++) {
-                    for (int jt = 0; jt < nr_jt; jt++) {
-                        int ic     = ic_idx * MC;
-                        int M_blk  = (ic + MC <= M) ? MC : (M - ic);
-                        int N_curr = (jt * NR + NR <= N_blk) ? NR : (N_blk - jt * NR);
+                if (cfg->sched_mode == SCHED_LOOP) {
+                    #pragma omp for collapse(2) schedule(dynamic)
+                    for (int ic_idx = 0; ic_idx < nr_ic; ic_idx++) {
+                        for (int jt = 0; jt < nr_jt; jt++) {
+                            int ic     = ic_idx * MC;
+                            int M_blk  = (ic + MC <= M) ? MC : (M - ic);
+                            int N_curr = (jt * NR + NR <= N_blk) ? NR : (N_blk - jt * NR);
 
-                        const float *pA_panel = packed_A_all + (size_t)ic_idx * packed_A_stride;
-                        const float *pB_strip = packed_B + (size_t)jt * K_blk * NR;
+                            const float *pA_panel = packed_A_all + (size_t)ic_idx * packed_A_stride;
+                            const float *pB_strip = packed_B + (size_t)jt * K_blk * NR;
 
-                        macro_kernel(pA_panel, pB_strip,
-                                     C + ic * ldc + jc + jt * NR,
-                                     M_blk, K_blk, N_curr, MR, NR,
-                                     alpha, beta_k, ldc, kfn,
-                                     cfg->use_nt_store);
+                            macro_kernel(pA_panel, pB_strip,
+                                         C + ic * ldc + jc + jt * NR,
+                                         M_blk, K_blk, N_curr, MR, NR,
+                                         alpha, beta_k, ldc, kfn,
+                                         cfg->use_nt_store);
+                        }
+                    }
+                } else {
+                    /* SCHED_TASK: Use omp taskloop for 2D tiles */
+                    #pragma omp single
+                    {
+                        #pragma omp taskloop collapse(2) grainsize(1)
+                        for (int ic_idx = 0; ic_idx < nr_ic; ic_idx++) {
+                            for (int jt = 0; jt < nr_jt; jt++) {
+                                int ic     = ic_idx * MC;
+                                int M_blk  = (ic + MC <= M) ? MC : (M - ic);
+                                int N_curr = (jt * NR + NR <= N_blk) ? NR : (N_blk - jt * NR);
+
+                                const float *pA_panel = packed_A_all + (size_t)ic_idx * packed_A_stride;
+                                const float *pB_strip = packed_B + (size_t)jt * K_blk * NR;
+
+                                macro_kernel(pA_panel, pB_strip,
+                                             C + ic * ldc + jc + jt * NR,
+                                             M_blk, K_blk, N_curr, MR, NR,
+                                             alpha, beta_k, ldc, kfn,
+                                             cfg->use_nt_store);
+                            }
+                        }
                     }
                 }
             }
@@ -308,110 +332,190 @@ static void sgemm_task2(int M, int N, int K,
 
     #pragma omp parallel num_threads(nthd)
     {
-        /* ── Phase 1: spawn all K-slice tasks (single thread) ── */
-        #pragma omp single
-        {
+        /* ── Phase 1: Computation (K-replication) ── */
+        if (cfg->sched_mode == SCHED_LOOP) {
+            #pragma omp for collapse(3) schedule(dynamic)
             for (int jc_idx = 0; jc_idx < nr_jc; jc_idx++) {
-                int jc    = jc_idx * NC;
-                int N_blk = (jc + NC <= N) ? NC : (N - jc);
-                int nr_jt = (N_blk + NR - 1) / NR;
-
                 for (int ic_idx = 0; ic_idx < nr_ic; ic_idx++) {
-                    int ic       = ic_idx * MC;
-                    int M_blk    = (ic + MC <= M) ? MC : (M - ic);
-                    int tile_idx = ic_idx * nr_jc + jc_idx;
-
                     for (int kr = 0; kr < r; kr++) {
-                        float *pC_partial  = partial_C[tile_idx * r + kr];
+                        int jc    = jc_idx * NC;
+                        int N_blk = (jc + NC <= N) ? NC : (N - jc);
+                        int nr_jt = (N_blk + NR - 1) / NR;
+                        int ic    = ic_idx * MC;
+                        int M_blk = (ic + MC <= M) ? MC : (M - ic);
+                        int tile_idx = ic_idx * nr_jc + jc_idx;
 
+                        float *pC_partial  = partial_C[tile_idx * r + kr];
                         int total_k_slices = (K + KC - 1) / KC;
                         int slices_per_r   = (total_k_slices + r - 1) / r;
                         int pc_start = kr * slices_per_r * KC;
                         int pc_end   = pc_start + slices_per_r * KC;
                         if (pc_end > K) pc_end = K;
+
                         if (pc_start >= K) {
                             memset(pC_partial, 0, partial_c_size);
-                            continue;
-                        }
-
-                        #pragma omp task firstprivate(ic, jc, M_blk, N_blk, \
-                                                      pc_start, pc_end,      \
-                                                      pC_partial, nr_jt)     \
-                                         shared(thr_pA, thr_pB)
-                        {
-                            int    tid = omp_get_thread_num();
-                            float *pA  = thr_pA[tid];
-                            float *pB  = thr_pB[tid];
-
+                        } else {
+                            int tid = omp_get_thread_num();
+                            float *pA = thr_pA[tid];
+                            float *pB = thr_pB[tid];
                             memset(pC_partial, 0, partial_c_size);
 
                             for (int pc = pc_start; pc < pc_end; pc += KC) {
                                 int K_blk = (pc + KC <= K) ? KC : (K - pc);
-
-                                pack_A_panel(A + ic * lda + pc, lda,
-                                             pA, M_blk, K_blk, MR);
-                                pack_B_strip(B + pc * ldb + jc, ldb,
-                                             pB, K_blk, N_blk, NR,
-                                             0, nr_jt);
-
+                                pack_A_panel(A + ic * lda + pc, lda, pA, M_blk, K_blk, MR);
+                                pack_B_strip(B + pc * ldb + jc, ldb, pB, K_blk, N_blk, NR, 0, nr_jt);
                                 float bk = (pc == pc_start) ? 0.0f : 1.0f;
                                 for (int jt = 0; jt < nr_jt; jt++) {
-                                    int n_curr = (jt * NR + NR <= N_blk)
-                                                 ? NR : (N_blk - jt * NR);
-                                    macro_kernel(pA,
-                                                 pB + (size_t)jt * K_blk * NR,
-                                                 pC_partial + jt * NR,
-                                                 M_blk, K_blk, n_curr,
-                                                 MR, NR, alpha, bk, NC, kfn, 0);
+                                    int n_curr = (jt * NR + NR <= N_blk) ? NR : (N_blk - jt * NR);
+                                    macro_kernel(pA, pB + (size_t)jt * K_blk * NR, pC_partial + jt * NR,
+                                                 M_blk, K_blk, n_curr, MR, NR, alpha, bk, NC, kfn, 0);
                                 }
                             }
-                        } /* end task */
-                    } /* kr */
-                } /* ic_idx */
-            } /* jc_idx */
+                        }
+                    }
+                }
+            }
+        } else {
+            /* SCHED_TASK: spawn tasks (current logic) */
+            #pragma omp single
+            {
+                for (int jc_idx = 0; jc_idx < nr_jc; jc_idx++) {
+                    int jc    = jc_idx * NC;
+                    int N_blk = (jc + NC <= N) ? NC : (N - jc);
+                    int nr_jt = (N_blk + NR - 1) / NR;
 
-            #pragma omp taskwait
-        } /* end omp single — implicit barrier syncs all threads here */
+                    for (int ic_idx = 0; ic_idx < nr_ic; ic_idx++) {
+                        int ic       = ic_idx * MC;
+                        int M_blk    = (ic + MC <= M) ? MC : (M - ic);
+                        int tile_idx = ic_idx * nr_jc + jc_idx;
 
-        /* ── Phase 2: parallel AVX2-vectorized reduction ── */
+                        for (int kr = 0; kr < r; kr++) {
+                            float *pC_partial  = partial_C[tile_idx * r + kr];
+
+                            int total_k_slices = (K + KC - 1) / KC;
+                            int slices_per_r   = (total_k_slices + r - 1) / r;
+                            int pc_start = kr * slices_per_r * KC;
+                            int pc_end   = pc_start + slices_per_r * KC;
+                            if (pc_end > K) pc_end = K;
+                            if (pc_start >= K) {
+                                memset(pC_partial, 0, partial_c_size);
+                                continue;
+                            }
+
+                            #pragma omp task firstprivate(ic, jc, M_blk, N_blk, \
+                                                          pc_start, pc_end,      \
+                                                          pC_partial, nr_jt)     \
+                                             shared(thr_pA, thr_pB)
+                            {
+                                int    tid = omp_get_thread_num();
+                                float *pA  = thr_pA[tid];
+                                float *pB  = thr_pB[tid];
+
+                                memset(pC_partial, 0, partial_c_size);
+
+                                for (int pc = pc_start; pc < pc_end; pc += KC) {
+                                    int K_blk = (pc + KC <= K) ? KC : (K - pc);
+
+                                    pack_A_panel(A + ic * lda + pc, lda,
+                                                 pA, M_blk, K_blk, MR);
+                                    pack_B_strip(B + pc * ldb + jc, ldb,
+                                                 pB, K_blk, N_blk, NR,
+                                                 0, nr_jt);
+
+                                    float bk = (pc == pc_start) ? 0.0f : 1.0f;
+                                    for (int jt = 0; jt < nr_jt; jt++) {
+                                        int n_curr = (jt * NR + NR <= N_blk)
+                                                     ? NR : (N_blk - jt * NR);
+                                        macro_kernel(pA,
+                                                     pB + (size_t)jt * K_blk * NR,
+                                                     pC_partial + jt * NR,
+                                                     M_blk, K_blk, n_curr,
+                                                     MR, NR, alpha, bk, NC, kfn, 0);
+                                    }
+                                }
+                            } /* end task */
+                        } /* kr */
+                    } /* ic_idx */
+                } /* jc_idx */
+                #pragma omp taskwait
+            } /* end omp single */
+        }
+
+        /* ── Phase 2: Reduction ── */
         __m256 vbeta = _mm256_set1_ps(beta);
 
-        #pragma omp for collapse(2) schedule(static)
-        for (int ic_idx = 0; ic_idx < nr_ic; ic_idx++) {
-            for (int jc_idx = 0; jc_idx < nr_jc; jc_idx++) {
-                int ic       = ic_idx * MC;
-                int jc       = jc_idx * NC;
-                int M_blk    = (ic + MC <= M) ? MC : (M - ic);
-                int N_blk    = (jc + NC <= N) ? NC : (N - jc);
-                int tile_idx = ic_idx * nr_jc + jc_idx;
+        if (cfg->sched_mode == SCHED_LOOP) {
+            #pragma omp for collapse(2) schedule(static)
+            for (int ic_idx = 0; ic_idx < nr_ic; ic_idx++) {
+                for (int jc_idx = 0; jc_idx < nr_jc; jc_idx++) {
+                    int ic    = ic_idx * MC;
+                    int jc    = jc_idx * NC;
+                    int M_blk = (ic + MC <= M) ? MC : (M - ic);
+                    int N_blk = (jc + NC <= N) ? NC : (N - jc);
+                    int tile_idx = ic_idx * nr_jc + jc_idx;
 
-                for (int kr = 0; kr < r; kr++) {
-                    float *pCp  = partial_C[tile_idx * r + kr];
-                    int    first = (kr == 0);
-
-                    for (int i = 0; i < M_blk; i++) {
-                        float *Crow = C   + (ic + i) * ldc + jc;
-                        float *Prow = pCp + i * NC;
-                        int j = 0;
-
-                        if (first) {
-                            for (; j <= N_blk - 8; j += 8) {
-                                __m256 cv = _mm256_loadu_ps(Crow + j);
-                                __m256 pv = _mm256_loadu_ps(Prow + j);
-                                _mm256_storeu_ps(Crow + j,
-                                    _mm256_fmadd_ps(vbeta, cv, pv));
+                    for (int kr = 0; kr < r; kr++) {
+                        float *pCp  = partial_C[tile_idx * r + kr];
+                        int    first = (kr == 0);
+                        for (int i = 0; i < M_blk; i++) {
+                            float *Crow = C   + (ic + i) * ldc + jc;
+                            float *Prow = pCp + i * NC;
+                            int j = 0;
+                            if (first) {
+                                for (; j <= N_blk - 8; j += 8) {
+                                    __m256 cv = _mm256_loadu_ps(Crow + j);
+                                    __m256 pv = _mm256_loadu_ps(Prow + j);
+                                    _mm256_storeu_ps(Crow + j, _mm256_fmadd_ps(vbeta, cv, pv));
+                                }
+                                for (; j < N_blk; j++) Crow[j] = beta * Crow[j] + Prow[j];
+                            } else {
+                                for (; j <= N_blk - 8; j += 8) {
+                                    __m256 cv = _mm256_loadu_ps(Crow + j);
+                                    __m256 pv = _mm256_loadu_ps(Prow + j);
+                                    _mm256_storeu_ps(Crow + j, _mm256_add_ps(cv, pv));
+                                }
+                                for (; j < N_blk; j++) Crow[j] += Prow[j];
                             }
-                            for (; j < N_blk; j++)
-                                Crow[j] = beta * Crow[j] + Prow[j];
-                        } else {
-                            for (; j <= N_blk - 8; j += 8) {
-                                __m256 cv = _mm256_loadu_ps(Crow + j);
-                                __m256 pv = _mm256_loadu_ps(Prow + j);
-                                _mm256_storeu_ps(Crow + j,
-                                    _mm256_add_ps(cv, pv));
+                        }
+                    }
+                }
+            }
+        } else {
+            /* SCHED_TASK: Reduction via taskloop with better grainsize */
+            #pragma omp single
+            {
+                #pragma omp taskloop collapse(2) grainsize(8)
+                for (int ic_idx = 0; ic_idx < nr_ic; ic_idx++) {
+                    for (int jc_idx = 0; jc_idx < nr_jc; jc_idx++) {
+                        int ic    = ic_idx * MC;
+                        int jc    = jc_idx * NC;
+                        int M_blk = (ic + MC <= M) ? MC : (M - ic);
+                        int N_blk = (jc + NC <= N) ? NC : (N - jc);
+                        int tile_idx = ic_idx * nr_jc + jc_idx;
+
+                        for (int kr = 0; kr < r; kr++) {
+                            float *pCp  = partial_C[tile_idx * r + kr];
+                            int    first = (kr == 0);
+                            for (int i = 0; i < M_blk; i++) {
+                                float *Crow = C   + (ic + i) * ldc + jc;
+                                float *Prow = pCp + i * NC;
+                                int j = 0;
+                                if (first) {
+                                    for (; j <= N_blk - 8; j += 8) {
+                                        __m256 cv = _mm256_loadu_ps(Crow + j);
+                                        __m256 pv = _mm256_loadu_ps(Prow + j);
+                                        _mm256_storeu_ps(Crow + j, _mm256_fmadd_ps(vbeta, cv, pv));
+                                    }
+                                    for (; j < N_blk; j++) Crow[j] = beta * Crow[j] + Prow[j];
+                                } else {
+                                    for (; j <= N_blk - 8; j += 8) {
+                                        __m256 cv = _mm256_loadu_ps(Crow + j);
+                                        __m256 pv = _mm256_loadu_ps(Prow + j);
+                                        _mm256_storeu_ps(Crow + j, _mm256_add_ps(cv, pv));
+                                    }
+                                    for (; j < N_blk; j++) Crow[j] += Prow[j];
+                                }
                             }
-                            for (; j < N_blk; j++)
-                                Crow[j] += Prow[j];
                         }
                     }
                 }

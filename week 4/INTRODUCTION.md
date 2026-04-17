@@ -72,9 +72,28 @@ It's the difference between carrying groceries in one hand vs. using a massive c
 
 In our project, we have a micro-kernel named `6x16`. It takes 6 rows from A, 16 columns from B, and calculates 96 results at once using these wide AVX lanes effortlessly.
 
+### Trick #3: Latency Hiding (The "Multiple Bowls" Strategy)
+Even with AVX, a single calculation takes a few clock cycles to complete. If the Chef waits for the first bowl of soup to heat up before doing anything else, they are wasting time. 
+Instead, we use **multiple independent accumulators**. The Chef effectively works on 4 or 12 "bowls" at once. While Bowl #1 is being processed by the hardware, the CPU is already starting the work for Bowl #2. This keeps the CPU's execution units busy every single nanosecond.
+
 ---
 
-## 5. Working Together: Multi-threading
+## 5. The Macro-Kernel: Preparing the Kitchen
+
+While the Micro-Kernel does the chopping, the **Macro-Kernel** is the sous-chef who manages the countertop (L2/L3 Caches).
+
+### Software Prefetching (Looking Ahead)
+The CPU is so fast that it often outruns its own cache. To prevent this, we use **Software Prefetching**. 
+While the Chef is working on the current set of ingredients, they are already reaching out to the Fridge (L3) to pull the *next* set of ingredients onto the Countertop (L2). By the time the current job is done, the next ingredients are already sitting right there, cold and ready.
+
+### Non-Temporal (NT) Stores (Bypassing the Crowded Counter)
+When we finally finish a massive calculation, we need to write the result back to the Grocery Store (RAM). 
+Normally, the CPU tries to put everything on the Countertop (L2 Cache) first "just in case" you need it again. But matrix results are often so large they would shove all your useful ingredients off the counter!
+We use **Non-Temporal Stores** to tell the CPU: *"Don't put this in the cache; I won't need it again soon. Send it straight to the Grocery Store."* This keeps our fast caches clean and ready for the next set of ingredients.
+
+---
+
+## 6. Working Together: Multi-threading
 
 What if we have multiple chefs (CPU Cores)? We need to split the work so they don't step on each other's toes.
 
@@ -89,9 +108,29 @@ Instead of leaving chefs idle, we use **3D Parallelism**.
 - They both output "partial" answers.
 - At the very end, we use a lightning-fast vector addition step (a **Reduction**) to squish their partial answers together into the final number.
 
+### Adaptive Tiling (Load Balancing)
+Even the best chefs work at different speeds if the recipe is complex. If we just give everyone one giant pile of work, some might finish early and sit idle. 
+Our system uses **Adaptive MC scaling**. If the matrix is small or we have many cores, we automatically shrink the job sizes ("tiles") so there are more jobs to go around. This ensures that every Chef is always busy until the very last second.
+
+### Loops vs. Tasks (The Factory vs. The Team)
+There are two ways to tell the Chefs what to do:
+1. **Loop-based Parallelism (`omp for`)**: Like a rigid factory assembly line. It is incredibly fast for standard, regular work. 
+2. **Task-based Parallelism (`omp task`)**: Like a flexible emergency response team. Every job is a "ticket" that any available Chef can pick up. 
+While Tasks are more flexible, they have more "paperwork" (overhead). We benchmarked both and found that for predictable grids like matrix math, the **Loop-based factory** is usually the winner!
+
 ---
 
-## 6. Auto-Tuning: Finding the Perfect Setup
+## 7. BLAS 1: The Basic Building Blocks
+
+While SGEMM is the "heavy lifter" for big grids, every math library needs basic tools for smaller jobs—like scaling a single row or adding two vectors. These are called **BLAS Level 1** operations.
+
+- **The Knives and Spoons:** Operations like `sscal` (multiplying a vector by a constant) or `saxpy` (adding a multiple of one vector to another).
+- **AVX Optimized:** Just like our big matrix kernel, these tiny tools use AVX2 "bulk carrier" instructions.
+- **Latency Hiding:** Even for a simple addition, we use multiple independent accumulators so the CPU can calculate different parts of the vector simultaneously using both "hands."
+
+---
+
+## 8. Auto-Tuning: Finding the Perfect Setup
 
 Different computers have different sized "fridges" and "countertops" (Caches). A tile size of `120x512` might run brilliantly on an Intel CPU, but terribly on an AMD CPU.
 
@@ -100,5 +139,13 @@ Our Python scripts act like a director: they ask the C code to try dozens of dif
 
 ---
 
+## 9. Compatibility (Speaking International Languages)
+
+Scientific software is often written in many languages, like **Fortran** or **Python**. To make our library useful to everyone, we implemented the **Fortran ABI**. This is like a set of international translation rules that allow old, powerful scientific programs to talk to our modern, lightning-fast C code without any confusion.
+
+---
+
 ### Summary
-By managing memory carefully (Tiling and Packing), doing math in bulk (AVX2), effectively using all CPU cores (Multi-threading), and adapting to the hardware (Auto-tuning), this project takes an operation that would normally take a computer several seconds and completes it in a fraction of a millisecond, outperforming commercial libraries like OpenBLAS!
+By managing memory carefully (**Tiling and Packing**), doing math in bulk (**AVX2**), hiding hardware latency (**Independent Accumulators**), effectively using all CPU cores (**Adaptive Multi-threading**), and automatically adapting to the hardware (**Auto-tuning**), this project takes operations that would normally take a computer several seconds and completes them in a fraction of a millisecond. 
+
+Whether it's the massive heavy-lifting of SGEMM or the swift utilities of BLAS 1, this library is built to squeeze every drop of performance out of modern silicon.

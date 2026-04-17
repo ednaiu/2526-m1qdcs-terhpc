@@ -1,0 +1,161 @@
+\documentclass{beamer}
+\usetheme{Madrid}
+\usecolortheme{default}
+\usepackage{booktabs}
+\usepackage{graphicx}
+
+\title{Week 4: BLAS 1 Optimization \& SGEMM Parallel Scheduling}
+\author{High-Performance Computing Project}
+\date{\today}
+
+\begin{document}
+
+\frame{\titlepage}
+
+\begin{frame}{What is BLAS Level 1?}
+    \textbf{BLAS Level 1} operations are fundamental vector math tools used inside larger algorithms (like SGEMM). They deal entirely with 1D arrays (vectors).
+    \vspace{0.4cm}
+    \begin{itemize}
+        \item \textbf{sscal}: Scales a vector by a constant ($x \leftarrow \alpha x$)
+        \item \textbf{scopy}: Copies one vector to another ($y \leftarrow x$)
+        \item \textbf{sswap}: Swaps the contents of two vectors
+        \item \textbf{saxpy}: Alpha X Plus Y ($y \leftarrow \alpha x + y$)
+        \item \textbf{sdot}: Computes the dot product of two vectors
+        \item \textbf{snrm2}: Calculates the Euclidean norm of a vector (length)
+        \item \textbf{sasum}: Calculates the sum of absolute values
+        \item \textbf{isamax}: Finds the index of the maximum absolute value
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{Step 1: The Scalar Baseline (The "Naive" Approach)}
+    \textbf{Concept:} A simple C \texttt{for} loop processing one array element at a time in sequence. \\
+    \vspace{0.2cm}
+    \textbf{Why it fails:} Processing one float per clock cycle starves the CPU. It explicitly ignores the massive arithmetic logic units (ALUs) and memory buses available on modern chips.
+    \vspace{0.2cm}
+    
+    \textbf{Results (N=1M)}:
+    \begin{table}[]
+    \centering
+    \begin{tabular}{@{}l|c|cc|c@{}}
+    \toprule
+    \textbf{Kernel} & \textbf{Metric}  & \textbf{Scalar} & \textbf{OpenBLAS} & \textbf{\% of OpenBLAS} \\ \midrule
+    \texttt{scopy}  & GB/s             & 21.78           & 17.95             & 121\%                   \\
+    \texttt{saxpy}  & GFLOP/s          & 5.54            & 41.72             & \textbf{13\%}           \\
+    \texttt{sdot}   & GFLOP/s          & 1.68            & 7.51              & \textbf{22\%}           \\
+    \texttt{snrm2}  & GFLOP/s          & 1.70            & 5.55              & \textbf{30\%}           \\ \bottomrule
+    \end{tabular}
+    \end{table}
+    
+    \textit{Takeaway: Simple memory moves do okay due to the CPU's hardware prefetcher predicting the linear read, but compute-heavy reductions (\texttt{sdot}, \texttt{snrm2}) are severely bottlenecked.}
+\end{frame}
+
+\begin{frame}{Step 2: SIMD Vectorization (AVX2)}
+    \textbf{Concept:} Using AVX2 intrinsics (compiler functions) to load, process, and store 8 floating points simultaneously per clock cycle using 256-bit registers.\\
+    \vspace{0.2cm}
+    \textbf{Why performance changes:} We parallelize the math physically instead of logically, allowing the processor to execute 8 multiplications simultaneously (using FMA).
+    \vspace{0.2cm}
+    
+    \textbf{Results (Speedup over Scalar)}:
+    \begin{table}[]
+    \centering
+    \begin{tabular}{@{}l|cc|c@{}}
+    \toprule
+    \textbf{Kernel} & \textbf{Scalar} & \textbf{AVX2} & \textbf{Speedup} \\ \midrule
+    \texttt{scopy} (GB/s)   & 21.78           & 22.10         & 1.01x            \\
+    \texttt{saxpy} (GF/s)   & 5.54            & 5.56          & 1.00x            \\
+    \texttt{sdot} (GF/s)    & 1.68            & 7.32          & \textbf{4.35x}   \\
+    \texttt{snrm2} (GF/s)   & 1.70            & 14.99         & \textbf{8.81x}   \\ \bottomrule
+    \end{tabular}
+    \end{table}
+    
+    \textit{Takeaway: Massive speedups for reductions where math is the bottleneck. \texttt{scopy} and \texttt{saxpy} see no gain because a single core is already reading from RAM as fast as physically possible.}
+\end{frame}
+
+\begin{frame}{Step 3: Multi-threading \& Latency Hiding}
+    \textbf{Concept 1 (Threading):} OpenMP slices the massive array across 8 separate CPU cores. This allows us to use 8 memory channels at once.\\
+    \textbf{Concept 2 (Latency Hiding):} Using multiple independent accumulator registers prevents the CPU from waiting for a previous instruction to finish.
+    \vspace{0.3cm}
+    
+    \textbf{Final Results (N=1M, 8 Threads)}:
+    \begin{table}[]
+    \centering
+    \begin{tabular}{@{}l|cc|c|c@{}}
+    \toprule
+    \textbf{Kernel} & \textbf{AVX2} & \textbf{AVX2+OMP} & \textbf{OpenBLAS} & \textbf{\% of OpenBLAS} \\ \midrule
+    \texttt{sscal} (GB/s)   & 19.78         & \textbf{134.40}   & 18.12             & \textbf{741\%}          \\
+    \texttt{saxpy} (GF/s)   & 5.56          & \textbf{42.63}    & 41.72             & \textbf{102\%}          \\
+    \texttt{sdot} (GF/s)    & 7.32          & \textbf{54.60}    & 7.51              & \textbf{727\%}          \\
+    \texttt{snrm2} (GF/s)   & 14.99         & \textbf{91.98}    & 5.55              & \textbf{1658\%}         \\ \bottomrule
+    \end{tabular}
+    \end{table}
+    
+    \textit{Takeaway: By distributing the load and keeping hardware fully saturated, we drastically outperform standard OpenBLAS implementations!}
+\end{frame}
+
+
+\begin{frame}{SGEMM Parallel Tasking: Loops vs. Tasks}
+    After mastering micro-optimizations, we analyzed \textbf{how} to distribute macro workloads for Matrix Multiplication (SGEMM). \\
+    \vspace{0.5cm}
+    \textbf{1. Loop-based (\texttt{\#pragma omp for collapse}):}
+    \begin{itemize}
+        \item Like a rigid, heavily organized factory assembly line.
+        \item Statically or dynamically divides the matrix grid upfront. 
+        \item \textbf{Pros:} Near-zero overhead.
+    \end{itemize}
+    \vspace{0.2cm}
+    \textbf{2. Task-based (\texttt{\#pragma omp task}):}
+    \begin{itemize}
+        \item Like a flexible restaurant kitchen ticket system.
+        \item A master thread dynamically spawns independent tasks (tiles). Any idle worker can take the next task packet. 
+        \item \textbf{Pros:} Perfect for unbalanced or irregular workloads.
+    \end{itemize}
+\end{frame}
+
+\begin{frame}{SGEMM Scheduling: Measuring the Overhead}
+    \textbf{Results (N=128 to 2048, 8 threads)}:
+    \begin{table}[]
+    \centering
+    \begin{tabular}{@{}c|cc|l@{}}
+    \toprule
+    \textbf{Matrix} & \textbf{LOOP (GF/s)} & \textbf{TASK (GF/s)} & \textbf{Relative Difference} \\ \midrule
+    \textbf{128}   & \textbf{85.16}       & 6.09                 & \textbf{Task is 14.0x Slower} \\
+    \textbf{256}   & \textbf{208.03}      & 26.06                & \textbf{Task is 8.0x Slower}  \\
+    \textbf{512}   & \textbf{341.91}      & 204.30               & \textbf{Task is 1.6x Slower}  \\
+    \textbf{1024}  & \textbf{420.54}      & 378.00               & \textbf{Task is 1.1x Slower}  \\
+    \textbf{2048}  & \textbf{452.23}      & 435.48               & \textbf{Task is 1.03x Slower} \\ \bottomrule
+    \end{tabular}
+    \end{table}
+    \vspace{0.3cm}
+    \textbf{Why the extreme gap for small matrices?} \\
+    For small matrices, creating the task structures in memory (pointers, captured variables) takes longer than multiplying the actual tile. The CPU spends all its time ``doing paperwork."
+\end{frame}
+
+\begin{frame}{SGEMM Scheduling: The Convergence}
+    \textbf{Finding the Crossover Point:}\\
+    Matrix multiplication computational work scales as $\mathcal{O}(N^3)$. However, the number of tiles (and therefore the number of tasks) only scales as $\mathcal{O}(N^2)$.
+    
+    \vspace{0.4cm}
+    \begin{itemize}
+        \item As $N$ doubles, the math workload multiplies by $8x$.
+        \item As $N$ doubles, the scheduling paperwork multiplies by only $4x$.
+    \end{itemize}
+    \vspace{0.4cm}
+    Eventually, the time spent inside the $6\times16$ micro-kernel completely overshadows the time it took to create the task. This is why at $N=2048$, the Task-based implementation reaches $96\%$ of the efficiency of the Loop-based implementation.
+\end{frame}
+
+\begin{frame}{Final Comparison \& Conclusion}
+    \textbf{When to use what?}
+    \begin{itemize}
+        \item \textbf{Data Size:} Micro-parallelism (AVX2) improves performance everywhere, but Macro-parallelism (OpenMP) only delivers true speedups on large data sets where overhead is amortized.
+        \item \textbf{Scheduling:} For highly predictable, dense data grids (like SGEMM), avoid \texttt{\#pragma omp task} due to initialization overhead. Stick to \texttt{\#pragma omp for}.
+    \end{itemize}
+    \vspace{0.4cm}
+    \textbf{Week 4 Achievements:}
+    \begin{itemize}
+        \item Built 9 BLAS Level 1 kernels from scratch with Fortran ABI compatibility.
+        \item Decisively outperformed OpenBLAS (up to 16x) on reductions using adaptive multi-threading and latency hiding strategies.
+        \item Quantified the exact point where dynamic task scheduling becomes viable vs. detrimental in strict mathematical workloads.
+    \end{itemize}
+\end{frame}
+
+\end{document}

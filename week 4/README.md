@@ -1,6 +1,19 @@
-# Week 3 — Advanced SGEMM Optimizations
+# Week 4 — BLAS 1 Optimized AVX2 Kernels + SGEMM (Week 3)
 
-## Quick Start
+## Quick Start — BLAS 1
+
+```bash
+# Build BLAS 1 test + bench
+make all-blas1
+
+# Run correctness tests (all 1287 tests vs OpenBLAS)
+OMP_NUM_THREADS=8 ./bin/test_blas1
+
+# Run performance benchmark (all kernels, all sizes)
+OMP_NUM_THREADS=8 ./bin/bench_blas1
+```
+
+## Quick Start — SGEMM (Week 3)
 
 ```bash
 # Build and test
@@ -14,13 +27,24 @@ cd autotuning
 python3 bayesian_optimizer.py --size 1024 --trials 30
 ```
 
-## Status: ✅ COMPLETE
+## Status: ✅ COMPLETE (Week 3 SGEMM)
 
-All 96 tests pass. Core optimizations implemented:
+All 96 SGEMM tests pass. Core optimizations implemented:
 - Loop unrolling ×4
 - Software prefetching (next-tile)
 - Non-temporal stores
 - ASM kernel bug fixes
+
+## Status: ✅ COMPLETE (Week 4 BLAS 1)
+
+All 1287 BLAS 1 tests pass (vs OpenBLAS reference). Kernels: `sscal`, `scopy`, `sswap`, `saxpy`, `sdot`, `snrm2`, `sasum`, `isamax`, `srot`.
+
+Three implementation layers per kernel:
+- **Scalar baseline** — readable reference
+- **AVX2** — 8-wide vectorized, software prefetch
+- **AVX2 + OpenMP** — parallel (skipped for small n < 4096)
+
+Fortran BLAS signatures implemented (trailing `_`, args by pointer).
 
 **Performance vs Week 2:** +30–111% improvement  
 **Performance vs OpenBLAS:** 3–25× faster at small/medium sizes

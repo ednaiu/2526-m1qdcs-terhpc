@@ -57,6 +57,22 @@ typedef enum {
 } parallel_mode_t;
 
 /* -----------------------------------------------------------------------
+ * Scheduling modes
+ *
+ *   SCHED_LOOP (default):
+ *     Use #pragma omp for collapse(...) constructs.
+ *     Optimized for regular loops and rigid iteration spaces.
+ *
+ *   SCHED_TASK:
+ *     Use #pragma omp task / taskloop constructs.
+ *     Allows for more dynamic load balancing and dependencies.
+ * ----------------------------------------------------------------------- */
+typedef enum {
+    SCHED_LOOP = 0,    /* Use omp for collapse           */
+    SCHED_TASK = 1,    /* Use omp task / taskloop        */
+} sched_mode_t;
+
+/* -----------------------------------------------------------------------
  * Run-time configuration
  * ----------------------------------------------------------------------- */
 typedef struct {
@@ -68,6 +84,7 @@ typedef struct {
     int nb_threads;  /* 0 = use OMP_NUM_THREADS env var                       */
     kernel_type_t   kernel;
     parallel_mode_t parallel_mode;
+    sched_mode_t    sched_mode;
     int r_tasks;     /* PARALLEL_3D only: K-replication factor (>= 1)         */
     int use_nt_store;/* 1 = non-temporal stores for C (stream_ps); 0 = normal */
 } sgemm_config_t;
@@ -78,6 +95,7 @@ typedef struct {
     .nb_threads = 0, \
     .kernel = KERNEL_6x16, \
     .parallel_mode = PARALLEL_2D, \
+    .sched_mode = SCHED_LOOP, \
     .r_tasks = 1, \
     .use_nt_store = 0 \
 }

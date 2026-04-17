@@ -89,6 +89,12 @@ static parallel_mode_t parse_parallel(const char *s)
     return PARALLEL_2D;
 }
 
+static sched_mode_t parse_sched(const char *s)
+{
+    if (!strcmp(s, "task")) return SCHED_TASK;
+    return SCHED_LOOP;
+}
+
 /* -----------------------------------------------------------------------
  * Single-config mode: adaptive timing, JSON output
  * ----------------------------------------------------------------------- */
@@ -171,18 +177,18 @@ static void bench_table(int nthd)
     int N_TRIALS = 7;
 
     struct { const char *name; sgemm_config_t cfg; } v[] = {
-        {"8x8  TASK1", {MC,KC,NC,nthd,KERNEL_8x8,     PARALLEL_2D,1}},
-        {"6x16 TASK1", {MC,KC,NC,nthd,KERNEL_6x16,    PARALLEL_2D,1}},
-        {"4x24 TASK1", {MC,KC,(NC/24)*24,nthd,KERNEL_4x24,PARALLEL_2D,1}},
-        {"6x16 ASM  ", {MC,KC,NC,nthd,KERNEL_6x16_ASM,PARALLEL_2D,1}},
-        {"6x16 TASK2", {MC,KC,NC,nthd,KERNEL_6x16,    PARALLEL_3D,nthd}},
+        {"TASK1 [LOOP]", {MC,KC,NC,nthd,KERNEL_6x16,    PARALLEL_2D, SCHED_LOOP, 1, 0}},
+        {"TASK1 [TASK]", {MC,KC,NC,nthd,KERNEL_6x16,    PARALLEL_2D, SCHED_TASK, 1, 0}},
+        {"TASK2 [LOOP]", {MC,KC,NC,nthd,KERNEL_6x16,    PARALLEL_3D, SCHED_LOOP, nthd, 0}},
+        {"TASK2 [TASK]", {MC,KC,NC,nthd,KERNEL_6x16,    PARALLEL_3D, SCHED_TASK, nthd, 0}},
+        {"ASM   [LOOP]", {MC,KC,NC,nthd,KERNEL_6x16_ASM,PARALLEL_2D, SCHED_LOOP, 1, 0}},
     };
     int nv = (int)(sizeof v / sizeof v[0]);
 
-    printf("=== SGEMM Week-2 Benchmark  (%d thread%s, N=%d/median) ===\n\n",
-           nthd, nthd>1?"s":"", N_TRIALS);
+    printf("=== SGEMM Parallel Scheduling Comparison (%d threads, N=%d) ===\n\n",
+           nthd, N_TRIALS);
     printf("%-6s  %12s", "Size", "OpenBLAS");
-    for (int i=0;i<nv;i++) printf("  %11s", v[i].name);
+    for (int i=0;i<nv;i++) printf("  %12s", v[i].name);
     printf("\n%-6s  %12s","------","(GF/s)");
     for (int i=0;i<nv;i++) printf("  %11s","GF/s(%%)");
     printf("\n");
@@ -213,7 +219,7 @@ static void bench_table(int nthd)
             }
             double med=median_d(ts,N_TRIALS);
             double gf=gflops(SZ,SZ,SZ,med);
-            printf("  %7.2f(%3.0f%%)",gf,gf/ob_gf*100.0);
+            printf("  %8.2f(%3.0f%%)",gf,gf/ob_gf*100.0);
         }
         printf("\n");
         free(A);free(B);free(C);free(C2);
@@ -275,12 +281,14 @@ int main(int argc, char **argv)
 
         const char *kname = get_str_arg(argc, argv, "--kernel",   "6x16");
         const char *pname = get_str_arg(argc, argv, "--parallel", "2D");
+        const char *sname = get_str_arg(argc, argv, "--sched",    "loop");
 
         sgemm_config_t cfg = {
             .MC = MC, .KC = KC, .NC = NC,
             .nb_threads = threads,
             .kernel = parse_kernel(kname),
             .parallel_mode = parse_parallel(pname),
+            .sched_mode = parse_sched(sname),
             .r_tasks = r_tasks,
         };
 
