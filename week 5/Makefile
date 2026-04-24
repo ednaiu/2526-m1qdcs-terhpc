@@ -1,4 +1,4 @@
-# Makefile for Week 4: SGEMM (Week 3) + BLAS 1 kernels
+# Makefile for Week 5: BLAS 2 kernels + BLAS 1 (Week 4) + SGEMM (Week 3)
 
 # Compiler and flags
 CC        := gcc
@@ -61,8 +61,8 @@ all: $(BENCH_BIN) $(SIMPLE_BIN)
 
 # Help target
 help:
-	@echo "Week 2 SGEMM Build System"
-	@echo "=========================="
+	@echo "Week 5 Build System — BLAS 2 + BLAS 1 + SGEMM"
+	@echo "================================================"
 	@echo ""
 	@echo "Build targets:"
 	@echo "  make all           — Build benchmark + simple test"
@@ -135,6 +135,24 @@ $(BIN_DIR)/simple_test.o: $(TEST_DIR)/simple_test.c $(INC_DIR)/sgemm.h | $(BIN_D
 
 $(SIMPLE_BIN): $(SGEMM_OBJ) $(BIN_DIR)/simple_test.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+# BLAS 1 object
+$(BLAS1_OBJ): $(BLAS1_SRC) $(INC_DIR)/blas1.h | $(BIN_DIR)
+	$(CC) $(CFLAGS) -I$(INC_DIR) -c $(BLAS1_SRC) -o $@
+
+# BLAS 1 test binary
+$(BIN_DIR)/test_blas1.o: $(TEST1_SRC) $(INC_DIR)/blas1.h | $(BIN_DIR)
+	$(CC) $(CFLAGS) $(OPENBLAS_CFLAGS) -I$(INC_DIR) -c $(TEST1_SRC) -o $@
+
+$(TEST1_BIN): $(BLAS1_OBJ) $(BIN_DIR)/test_blas1.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(OPENBLAS_LDFLAGS)
+
+# BLAS 1 bench binary
+$(BIN_DIR)/bench_blas1.o: $(BENCH1_SRC) $(INC_DIR)/blas1.h | $(BIN_DIR)
+	$(CC) $(CFLAGS) $(OPENBLAS_CFLAGS) -I$(INC_DIR) -c $(BENCH1_SRC) -o $@
+
+$(BENCH1_BIN): $(BLAS1_OBJ) $(BIN_DIR)/bench_blas1.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(OPENBLAS_LDFLAGS)
 
 # BLAS 2/3 objects
 $(BLAS2_OBJ): $(BLAS2_SRC) $(INC_DIR)/blas2.h | $(BIN_DIR)
