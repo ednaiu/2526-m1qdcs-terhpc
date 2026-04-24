@@ -2,7 +2,7 @@
  * blas2.c — Week 5: Optimised BLAS 2 kernels
  *
  * Optimisation layers per kernel:
- *   sgemv  : AVX2 (NoTrans row-dot, Trans column-partition), OpenMP
+ *   sgemv  : AVX2 (NoTrans row-dot, Trans row-saxpy), OpenMP
  *   sger   : AVX2 row FMA, OpenMP
  *   ssymv  : AVX2 for stored triangle (contiguous row), scalar reflected half, OpenMP
  *   strmv  : AVX2 for non-transposed paths (contiguous row), scalar for trans
@@ -83,9 +83,13 @@ void sgemv(char trans, int m, int n, float alpha, const float *a, int lda,
             y[i * incy] += alpha * sum;
         }
     } else {
-        /* --- Trans: y[j] += alpha * sum_i A[i,j] * x[i]
-         * Partition output y across threads, scalar inner loop.
-         * Column access (A[i*lda+j]) is non-contiguous → no AVX2.       */
+        /* --- Trans: y[j] += alpha * A^T[:,j] · x
+         * Recast as row-wise saxpy: for each row i of A,
+         *   y[j0..j1] += (alpha * x[i]) * A[i, j0..j1]
+         * A[i,j] is contiguous in j → full AVX2 FMA.
+         * Partition the output range [0,n) across threads; each thread
+         * owns its slice exclusively (no races on y). Inner loop over
+         * all m rows is sequential per thread.                           */
         #pragma omp parallel
         {
             int nt    = omp_get_num_threads();
@@ -93,10 +97,33 @@ void sgemv(char trans, int m, int n, float alpha, const float *a, int lda,
             int chunk = (n + nt - 1) / nt;
             int j0    = tid * chunk;
             int j1    = j0 + chunk; if (j1 > n) j1 = n;
-            for (int j = j0; j < j1; j++) {
-                float sum = 0.0f;
-                for (int i = 0; i < m; i++) sum += a[(size_t)i * lda + j] * x[i * incx];
-                y[j * incy] += alpha * sum;
+            int len   = j1 - j0;
+
+            for (int i = 0; i < m; i++) {
+                float scale = alpha * x[i * incx];
+                if (scale == 0.0f) continue;
+                const float *Ar = a + (size_t)i * lda + j0;
+                float       *yr = y + j0 * incy;
+
+                if (incy == 1) {
+                    __m256 vscale = _mm256_set1_ps(scale);
+                    int j = 0;
+                    for (; j <= len - 16; j += 16) {
+                        _mm256_storeu_ps(yr + j,
+                            _mm256_fmadd_ps(vscale, _mm256_loadu_ps(Ar + j),
+                                            _mm256_loadu_ps(yr + j)));
+                        _mm256_storeu_ps(yr + j + 8,
+                            _mm256_fmadd_ps(vscale, _mm256_loadu_ps(Ar + j + 8),
+                                            _mm256_loadu_ps(yr + j + 8)));
+                    }
+                    for (; j <= len - 8; j += 8)
+                        _mm256_storeu_ps(yr + j,
+                            _mm256_fmadd_ps(vscale, _mm256_loadu_ps(Ar + j),
+                                            _mm256_loadu_ps(yr + j)));
+                    for (; j < len; j++) yr[j] += scale * Ar[j];
+                } else {
+                    for (int j = 0; j < len; j++) yr[j * incy] += scale * Ar[j];
+                }
             }
         }
     }

@@ -52,8 +52,9 @@ typedef enum {
  *     More parallelism for small matrices with many cores.
  * ----------------------------------------------------------------------- */
 typedef enum {
-    PARALLEL_2D = 0,   /* TASK1: tiles of C, no K-splitting      */
-    PARALLEL_3D = 1,   /* TASK2: 3D with K-replication+reduction  */
+    PARALLEL_2D      = 0,   /* TASK1: tiles of C, no K-splitting      */
+    PARALLEL_3D      = 1,   /* TASK2: 3D with K-replication+reduction  */
+    PARALLEL_DYNAMIC = 2,   /* Choose 2D or 3D based on size/threads  */
 } parallel_mode_t;
 
 /* -----------------------------------------------------------------------
@@ -94,7 +95,7 @@ typedef struct {
     .MC = 120, .KC = 512, .NC = 4096, \
     .nb_threads = 0, \
     .kernel = KERNEL_6x16, \
-    .parallel_mode = PARALLEL_2D, \
+    .parallel_mode = PARALLEL_DYNAMIC, \
     .sched_mode = SCHED_LOOP, \
     .r_tasks = 1, \
     .use_nt_store = 0 \

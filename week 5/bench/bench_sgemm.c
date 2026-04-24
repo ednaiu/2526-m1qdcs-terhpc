@@ -85,7 +85,8 @@ static kernel_type_t parse_kernel(const char *s)
 
 static parallel_mode_t parse_parallel(const char *s)
 {
-    if (!strcmp(s, "3D")) return PARALLEL_3D;
+    if (!strcmp(s, "3D"))      return PARALLEL_3D;
+    if (!strcmp(s, "DYNAMIC")) return PARALLEL_DYNAMIC;
     return PARALLEL_2D;
 }
 

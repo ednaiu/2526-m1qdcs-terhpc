@@ -43,7 +43,7 @@ All 7 BLAS 2 kernels implemented with Fortran-compatible signatures and OpenMP p
 
 | Kernel | Operation | AVX2 | OpenMP |
 |--------|-----------|------|--------|
-| `sgemv` | y = alpha\*A\*x + beta\*y | ✅ (NoTrans path) | ✅ |
+| `sgemv` | y = alpha\*A\*x + beta\*y | ✅ Full (NoTrans/Trans) | ✅ |
 | `sger`  | A = alpha\*x\*y' + A | ✅ | ✅ |
 | `ssymv` | y = alpha\*A\*x + beta\*y (symmetric) | — | ✅ |
 | `strmv` | x = A\*x (triangular) | — | — |
@@ -150,7 +150,7 @@ Correctness: all 1287 test cases pass.
 Row-major dot product per output row. AVX2 inner loop with `_mm256_fmadd_ps`, horizontal sum via `hsum256`. Parallelized with `#pragma omp parallel for`.
 
 ### sgemv (Trans)
-Partitions the output vector `y` across threads — avoids atomic updates. Inner loop over rows is scalar (no AVX2 vectorization in this direction).
+Recast as row-wise saxpy: each row of A is added into the output slice `y[j0..j1]` owned by the thread. This converts strided column reads into contiguous row reads, enabling full AVX2 FMA vectorization and improving cache locality. Parallelized by partitioning the output range `n` across threads.
 
 ### sger
 Outer product rank-1 update. AVX2 vectorized inner loop over `n` (j-dimension), parallelized over rows with OpenMP.
@@ -169,7 +169,7 @@ Symmetric rank-1 / rank-2 update respecting `uplo`. Inner loop is scalar, parall
 
 ## Known Limitations
 
-1. `sgemv` transpose path: inner reduction loop not AVX2 vectorized — bottleneck for tall matrices with trans='T'.
+1. `ssymv`: reflected triangle access is currently scalar.
 2. `ssymv`/`ssyr`/`ssyr2`: no AVX2 intrinsics — only OpenMP parallelism.
 3. `isamax`: AVX2 variant falls back to scalar implementation.
 4. No task-based (OpenMP `task`) parallelism in BLAS 2 — uses `parallel for` instead.

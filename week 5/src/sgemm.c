@@ -335,8 +335,35 @@ void sgemm_small(int M, int N, int K, float alpha, const float *A, int lda, cons
 void sgemm_ex(int M, int N, int K, float alpha, const float *A, int lda, const float *B, int ldb, float beta, float *C, int ldc, const sgemm_config_t *cfg)
 {
     if ((long long)M*N*K < (128LL*128*128)) { sgemm_small(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, cfg); return; }
-    if (cfg->parallel_mode == PARALLEL_3D) sgemm_task2(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, cfg);
-    else sgemm_task1(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, cfg);
+
+    parallel_mode_t mode = cfg->parallel_mode;
+    sgemm_config_t dynamic_cfg = *cfg;
+
+    if (mode == PARALLEL_DYNAMIC) {
+        int nthd = (cfg->nb_threads > 0) ? cfg->nb_threads : omp_get_max_threads();
+        int nr_ic = (M + cfg->MC - 1) / cfg->MC;
+        int nr_jc = (N + cfg->NC - 1) / cfg->NC;
+        int total_2d_tiles = nr_ic * nr_jc;
+
+        if (total_2d_tiles < nthd && K > cfg->KC) {
+            mode = PARALLEL_3D;
+            /* Compute r to saturate threads: r = ceil(nthd / total_2d_tiles) */
+            int r = (nthd + total_2d_tiles - 1) / total_2d_tiles;
+            if (r < 1) r = 1;
+            /* Cap r to number of K-slices available */
+            int total_k_slices = (K + cfg->KC - 1) / cfg->KC;
+            if (r > total_k_slices) r = total_k_slices;
+            /* Power of 2 is often better for binary tree reductions */
+            int r_pow2 = 1;
+            while (r_pow2 * 2 <= r) r_pow2 *= 2;
+            dynamic_cfg.r_tasks = r_pow2;
+        } else {
+            mode = PARALLEL_2D;
+        }
+    }
+
+    if (mode == PARALLEL_3D) sgemm_task2(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, &dynamic_cfg);
+    else sgemm_task1(M, N, K, alpha, A, lda, B, ldb, beta, C, ldc, &dynamic_cfg);
 }
 
 void sgemm(int M, int N, int K, float alpha, const float *A, int lda, const float *B, int ldb, float beta, float *C, int ldc)

@@ -50,7 +50,7 @@ class SGEMMConfig:
     N: Optional[int] = None       # Defaults to M
     K: Optional[int] = None       # Defaults to M
     kernel: str = "6x16"          # 8x8, 6x16, 4x24, 6x16_asm
-    parallel: str = "2D"          # 2D, 3D
+    parallel: str = "2D"          # 2D, 3D, DYNAMIC
     threads: int = 1
     MC: int = 120
     KC: int = 512

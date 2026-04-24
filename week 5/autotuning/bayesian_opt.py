@@ -140,12 +140,18 @@ class BayesianOptimizer:
         self.kc_values = self.kc_values[(self.kc_values >= 64) & (self.kc_values <= 1536)]
         self.nc_values = self.nc_values[(self.nc_values >= self.NR) & (self.nc_values <= 16384)]
 
-    def _evaluate(self, MC: int, KC: int, NC: int) -> float:
+        # New parallelism dimensions
+        self.parallel_modes = [0, 1, 2]  # 2D, 3D, DYNAMIC
+        self.r_values = [1, 2, 4, 8]
+
+    def _evaluate(self, MC: int, KC: int, NC: int, parallel: int, r: int) -> float:
         """Run real benchmark."""
+        parallel_str = ["2D", "3D", "DYNAMIC"][int(parallel)]
         config = SGEMMConfig(
             M=self.M, N=self.N, K=self.K,
             kernel=self.kernel, threads=self.threads,
-            MC=int(MC), KC=int(KC), NC=int(NC)
+            MC=int(MC), KC=int(KC), NC=int(NC),
+            parallel=parallel_str, r_tasks=int(r)
         )
 
         if not self.runner.is_valid_config(config):
@@ -156,22 +162,24 @@ class BayesianOptimizer:
 
         self.history.append({
             'MC': int(MC), 'KC': int(KC), 'NC': int(NC),
+            'parallel': parallel_str, 'r': int(r),
             'gflops': gflops,
         })
 
         if self.verbose:
-            print(f"    MC={int(MC):4d} KC={int(KC):4d} NC={int(NC):5d} → {gflops:7.2f} GFLOP/s")
+            para_info = f"{parallel_str}(r={int(r)})"
+            print(f"    MC={int(MC):4d} KC={int(KC):4d} NC={int(NC):5d}  {para_info:10s} → {gflops:7.2f} GFLOP/s")
 
         return gflops
 
     def _get_initial_samples(self, n_init: int):
         """Generate diverse initial samples."""
         samples = [
-            (120, 512, 4096),   # Known good default
-            (96, 256, 2048),
-            (120, 768, 4096),
-            (240, 512, 8192),
-            (168, 384, 4096),
+            (120, 512, 4096, 2, 1),   # DYNAMIC, r=1
+            (120, 512, 4096, 0, 1),   # 2D, r=1
+            (96, 256, 2048, 1, 2),    # 3D, r=2
+            (168, 384, 4096, 2, 2),   # DYNAMIC, r=2
+            (120, 768, 4096, 0, 1),   # 2D
         ]
 
         # Add random samples if needed
@@ -180,7 +188,9 @@ class BayesianOptimizer:
             mc = np.random.choice(self.mc_values)
             kc = np.random.choice(self.kc_values)
             nc = np.random.choice(self.nc_values)
-            samples.append((int(mc), int(kc), int(nc)))
+            p  = np.random.choice(self.parallel_modes)
+            r  = np.random.choice(self.r_values)
+            samples.append((int(mc), int(kc), int(nc), int(p), int(r)))
 
         return samples[:n_init]
 
@@ -191,13 +201,17 @@ class BayesianOptimizer:
             mc = np.random.choice(self.mc_values)
             kc = np.random.choice(self.kc_values)
             nc = np.random.choice(self.nc_values)
+            p  = np.random.choice(self.parallel_modes)
+            r  = np.random.choice(self.r_values)
+            parallel_str = ["2D", "3D", "DYNAMIC"][int(p)]
             config = SGEMMConfig(
                 M=self.M, N=self.N, K=self.K,
                 kernel=self.kernel, threads=self.threads,
-                MC=int(mc), KC=int(kc), NC=int(nc)
+                MC=int(mc), KC=int(kc), NC=int(nc),
+                parallel=parallel_str, r_tasks=int(r)
             )
             if self.runner.is_valid_config(config):
-                candidates.append([mc, kc, nc])
+                candidates.append([mc, kc, nc, p, r])
         return np.array(candidates)
 
     def optimize(self, n_iterations: int = 25, n_init: int = 5):
@@ -219,9 +233,9 @@ class BayesianOptimizer:
         X_train = []
         y_train = []
 
-        for mc, kc, nc in init_samples:
-            score = self._evaluate(mc, kc, nc)
-            X_train.append([mc, kc, nc])
+        for mc, kc, nc, p, r in init_samples:
+            score = self._evaluate(mc, kc, nc, p, r)
+            X_train.append([mc, kc, nc, p, r])
             y_train.append(score)
 
         X_train = np.array(X_train)
@@ -250,8 +264,8 @@ class BayesianOptimizer:
             next_point = candidates[best_idx]
 
             # Evaluate
-            mc, kc, nc = int(next_point[0]), int(next_point[1]), int(next_point[2])
-            score = self._evaluate(mc, kc, nc)
+            mc, kc, nc, p, r = [int(next_point[i]) for i in range(5)]
+            score = self._evaluate(mc, kc, nc, p, r)
 
             if self.verbose:
                 print(f"  BO iter {iteration+1:2d}: EI={ei[best_idx]:.4f}")
@@ -261,15 +275,17 @@ class BayesianOptimizer:
 
         # Find best
         best_idx = np.argmax(y_train)
-        best_mc, best_kc, best_nc = X_train[best_idx]
+        best_mc, best_kc, best_nc, best_p, best_r = X_train[best_idx]
         best_gflops = y_train[best_idx]
+        best_para = ["2D", "3D", "DYNAMIC"][int(best_p)]
 
         wall_time = time.time() - start_time
 
         best_config = SGEMMConfig(
             M=self.M, N=self.N, K=self.K,
             kernel=self.kernel, threads=self.threads,
-            MC=int(best_mc), KC=int(best_kc), NC=int(best_nc)
+            MC=int(best_mc), KC=int(best_kc), NC=int(best_nc),
+            parallel=best_para, r_tasks=int(best_r)
         )
 
         from gradient_descent import OptimizationResult
@@ -328,6 +344,7 @@ def main():
     print(f"{'='*70}")
     cfg = result.best_config
     print(f"Best: MC={cfg.MC} KC={cfg.KC} NC={cfg.NC}")
+    print(f"      Parallelism: {cfg.parallel} (r={cfg.r_tasks})")
     print(f"Performance: {result.best_gflops:.2f} GFLOP/s")
     print(f"Evaluations: {result.total_evaluations}")
     print(f"Wall time: {result.wall_time_s:.1f}s")
@@ -343,7 +360,10 @@ def main():
             'problem_size': {'M': M, 'N': N, 'K': K},
             'kernel': args.kernel,
             'threads': args.threads,
-            'optimal_config': {'MC': cfg.MC, 'KC': cfg.KC, 'NC': cfg.NC},
+            'optimal_config': {
+                'MC': cfg.MC, 'KC': cfg.KC, 'NC': cfg.NC,
+                'parallel': cfg.parallel, 'r_tasks': cfg.r_tasks
+            },
             'best_gflops': result.best_gflops,
             'total_evaluations': result.total_evaluations,
             'wall_time_s': result.wall_time_s,
@@ -353,7 +373,7 @@ def main():
     # Save history
     history_file = os.path.join(RESULTS_DIR, f"bo_history_{M}x{N}x{K}.csv")
     with open(history_file, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=['MC', 'KC', 'NC', 'gflops'])
+        writer = csv.DictWriter(f, fieldnames=['MC', 'KC', 'NC', 'parallel', 'r', 'gflops'])
         writer.writeheader()
         writer.writerows(result.history)
     print(f"History saved to: {history_file}")
