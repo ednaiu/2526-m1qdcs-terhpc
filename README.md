@@ -132,7 +132,7 @@ Your course grade will be calculated as follows:
 2. Project report
 * You will write a 20-30 page report on your implementation. There is no fixed format, but make sure to use 11pt policy, single column page format, margins no less than 2cms.
 * The report should ideally contain following points:
-* A short introduction outlining the project goals and background (no more than 3 pages).
+* A short introduction outlining the project goals and background (no more than 3 pages) -> blas kernels, AI agent etc.
 * For each BLAS kernel (or group of kernels), I would like to see the approaches you tried (and succeeded/failed) using AI-driven development. What worked, what did not work, how much improvement did you get applying each optimization, when did AI failed so you had to intervene, when it succeded, etc.
 * Experimental section that compares your code's performance to OpenBLAS library
 * You should send your completed lab assignment completed to my university mail (oguz.kaya[at]universite-paris-saclay.fr) with subject line "M1QDCSTERHPC REPORT Firstname1 LASTNAME1 Firstname2 LASTNAME2" (e.g., M1QDCSTERHPC REPORT Jean-François DURAND Julie DUFONT).
