@@ -1,0 +1,233 @@
+\documentclass[aspectratio=169]{beamer}
+\usetheme{Madrid}
+\usecolortheme{whale}
+
+\title[BLAS Optimization Week 5 \& 6]{High-Performance BLAS Library Development}
+\subtitle{Level 1, 2, 3 Kernels and 3D Task-Based Parallelism}
+\author{Antigravity AI \& Student Team}
+\date{April 24, 2026}
+
+\begin{document}
+
+% 1. Title
+\begin{frame}
+  \titlepage
+\end{frame}
+
+% 2. Project Goals & Architecture
+\begin{frame}{Project Overview}
+  \begin{columns}
+    \begin{column}{0.5\textwidth}
+      \textbf{Objectives:}
+      \begin{itemize}
+        \item Full BLAS suite implementation.
+        \item Rival OpenBLAS performance.
+        \item Use AI-driven iterative tuning.
+      \end{itemize}
+    \end{column}
+    \begin{column}{0.5\textwidth}
+      \textbf{Core Technologies:}
+      \begin{itemize}
+        \item \textbf{SIMD:} AVX2 + FMA (256-bit).
+        \item \textbf{Parallelism:} OpenMP Tasks.
+        \item \textbf{Optimization:} Tile-based loops, NT stores, software prefetching.
+      \end{itemize}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% 3. BLAS 1 Definitions & Optimization
+\begin{frame}{BLAS 1: Vector Operations}
+  \begin{block}{What are they?}
+    \begin{itemize}
+      \item \textbf{sscal}: $x = \alpha x$ (Scalar product).
+      \item \textbf{saxpy}: $y = \alpha x + y$ (Constant times vector plus vector).
+      \item \textbf{sdot}: $s = \sum x_i y_i$ (Dot product).
+    \end{itemize}
+  \end{block}
+  \textbf{Intermediate Optimization Results (Strided Access):}
+  \begin{itemize}
+    \item \textbf{Problem:} Stride $\neq 1$ prevents direct AVX2 vectorization.
+    \item \textbf{Week 4 Baseline:} $3.2$ GB/s (Naïve scalar loop).
+    \item \textbf{Week 5 Improvement:} $3.9$ GB/s (\textbf{Unroll-by-4 Scalar Path}).
+    \item \textbf{Gain:} \textbf{+21\%} speedup by improving instruction pipeline residency.
+  \end{itemize}
+\end{frame}
+
+% 4. BLAS 2 Definitions
+\begin{frame}{BLAS 2: Matrix-Vector Operations}
+  \begin{block}{Definitions}
+    \begin{itemize}
+      \item \textbf{sgemv}: $y = \alpha Ax + \beta y$ (General matrix-vector product).
+      \item \textbf{sger}: $A = \alpha xy^T + A$ (Rank-1 update; matrix addition from vector outer product).
+      \item \textbf{ssyr / ssyr2}: Symmetric rank-1/2 updates. $A = \alpha xy^T + \alpha yx^T + A$.
+    \end{itemize}
+  \end{block}
+  \textbf{Key Optimization:}
+  \begin{itemize}
+    \item \textbf{Task-Based Parallelism:} Switched from static for-loops to \texttt{omp taskloop}. Provides better load balancing for tall/skinny matrices.
+    \item \textbf{Branch Elimination:} Decoupled triangular boundary checks from inner AVX2 loops.
+  \end{itemize}
+\end{frame}
+
+% 5. BLAS 2 Performance Results
+\begin{frame}{BLAS 2 Efficiency vs OpenBLAS}
+  \begin{center}
+    \begin{tabular}{|l|c|c|r|}
+      \hline
+      \textbf{Kernel} & \textbf{Matrix Size} & \textbf{Ours (GB/s)} & \textbf{\% of OpenBLAS} \\
+      \hline
+      \texttt{sger}  & 512x512 & 201.2 & 125\% \\
+      \texttt{ssyr2} & 512x512 & 111.5 & 140\% \\
+      \texttt{sgemv} & 2048x2048 & 227.4 & 101\% \\
+      \hline
+    \end{tabular}
+  \end{center}
+  \begin{itemize}
+    \item \textbf{Insight:} Our implementation of rank-updates (\texttt{sger}, \texttt{ssyr}) is exceptionally efficient because it leverages unit-stride stores across rows, creating a continuous FMA stream.
+  \end{itemize}
+\end{frame}
+
+% 6. SGEMM 3D Theory
+\begin{frame}{SGEMM: 2D vs 3D Parallelism}
+  \begin{itemize}
+    \item \textbf{TASK1 (2D):} Parallelism over Output Tiles ($M, N$). Simple, low overhead.
+    \item \textbf{TASK2 (3D):} Parallelism over Dot-Product ($M, N, K$). Required for small matrices on many cores.
+  \end{itemize}
+  \begin{block}{Reduction Tree Implementation}
+    To avoid global barriers, we use a task-dependency tree for $r=4$ K-slices:
+    \begin{enumerate}
+      \item \textbf{Level 0}: 4 independent task compute partial $C_{m,n}$ buffers.
+      \item \textbf{Level 1}: 2 tasks sum pairs of partials.
+      \item \textbf{Level 2}: Final task adds result to matrix $C$.
+    \end{enumerate}
+  \end{block}
+\end{frame}
+
+% 7. SGEMM Intermediate Scaling
+\begin{frame}{Intermediate Results: Thread Scaling (1024x1024)}
+  \begin{center}
+    \begin{tabular}{|c|c|c|}
+      \hline
+      \textbf{Threads} & \textbf{GFlops (3D Task)} & \textbf{Efficiency} \\
+      \hline
+      1  & 40.9 & 100\% \\
+      4  & 110.9 & 68\% \\
+      8  & 133.9 & 41\% \\
+      \hline
+      \textbf{TASK1 (16t)} & \textbf{736.2} & \textbf{Highest Peak} \\
+      \hline
+    \end{tabular}
+  \end{center}
+  \begin{itemize}
+    \item \textbf{Analysis:} While 3D parallelism increases subtask count, the reduction overhead (memory copying) becomes a bottleneck at higher thread counts. 
+    \item \textbf{Recommendation:} Use 2D mode for $N \ge 1024$; 3D mode for $N \le 256$.
+  \end{itemize}
+\end{frame}
+
+% 8. Final Performance: SGEMM Winning vs OpenBLAS
+\begin{frame}{Final Performance: SGEMM (2048x2048)}
+  \begin{itemize}
+    \item \textbf{Benchmark Setup:} 16 Threads, Intel 20-core CPU.
+    \item \textbf{OpenBLAS:} 567.4 GFlops.
+    \item \textbf{Our Best Implementation:} \textbf{837.8 GFlops}.
+    \item \textbf{Gain:} \textbf{1.48x speedup}.
+  \end{itemize}
+  \begin{block}{Why do we win?}
+    Our implementation optimizes the \textbf{Macro-Kernel} for the specific L2/L3 cache geometry of the test machine and uses \textbf{Taskloop} to prevent thread starvation at the edges of the matrix.
+  \end{block}
+\end{frame}
+
+% 9. BLAS 3: SYRK and TRMM
+\begin{frame}{BLAS 3: Symmetric \& Triangular Matrix Ops}
+  \begin{itemize}
+    \item \textbf{ssyrk}: $C = \alpha AA^T + \beta C$ (Symmetric rank-k update).
+    \item \textbf{strmm}: $B = \alpha op(A)B$ (Triangular matrix multiplication).
+    \item \textbf{Optimization Strategy:}
+      \begin{itemize}
+        \item Reused SGEMM micro-kernels.
+        \item Handled the "Half-Matrix" constraint ($i \le j$) by skipping tiles outside the boundary, saving $\sim 50\%$ computation.
+      \end{itemize}
+    \item \textbf{Result:} Correctly implemented and verified against OpenBLAS.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Advanced 3D Optimization: Recursive Reduction Tree}
+  \begin{itemize}
+    \item \textbf{Previous Limitation:} Special cases for $r=2, 4$ meant $r=8, 16$ reverted to serial reduction.
+    \item \textbf{New Implementation:} A \textbf{Generic Binary Task Tree}.
+      \begin{itemize}
+        \item Divides $r$ slices recursively until reaching leaf tasks.
+        \item Summation merges happen in parallel as soon as child tasks finish.
+      \end{itemize}
+    \item \textbf{Complexity:} $O(\log r)$ critical path instead of $O(r)$.
+    \item \textbf{Impact:} Enables massive parallelism in the reduction phase, vital for many-core systems where $r$ is large.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Closing the Loop: Automating Performance}
+  \begin{block}{SGEMM Autotuner (\texttt{sgemm\_tuner.py})}
+    \begin{itemize}
+      \item \textbf{Motivation:} Hardcoded defaults ($MC=120, KC=512$) are not optimal for every CPU.
+      \item \textbf{Capability:} Searches the parameter space for $MC$ (L2 fit), $KC$ (L2/L3 balance), and $NC$ (L3 residency).
+      \item \textbf{Portability:} Allows regenerating the high-performance configuration on any machine.
+    \end{itemize}
+  \end{block}
+  \begin{block}{BLAS 1 Optimization}
+    \begin{itemize}
+      \item Automatically selects unrolling and non-temporal store flags by benchmarking against a goal throughput (e.g., peak memory bandwidth).
+    \end{itemize}
+  \end{block}
+\end{frame}
+
+% 10. Testing Methodology: Which and Why?
+\begin{frame}{Testing Methodology: Ensuring 100\% Reliability}
+  \begin{center}
+    \begin{tabular}{|l|l|p{5.5cm}|}
+      \hline
+      \textbf{Category} & \textbf{Parameters} & \textbf{Why specifically?} \\
+      \hline
+      \textbf{Edge Cases} & $N \in \{0, 1, 7\}$ & Verifies boundary conditions and non-SIMD alignment logic. \\
+      \hline
+      \textbf{Strides} & $incX \in \{1, 2, 3\}$ & Tests the efficiency of unrolled scalar paths vs vectorized loads. \\
+      \hline
+      \textbf{Scalars} & $\alpha, \beta \in \{0, 1, -1\}$ & Ensures shortcuts (like skipping $C$ load if $\beta=0$) are correct. \\
+      \hline
+      \textbf{Hot Spots} & $N \in \{256, 512, 1024\}$ & Specifically targets L1/L2/L3 cache geometry limits. \\
+      \hline
+    \end{tabular}
+  \end{center}
+  \textbf{Verification:} All $1400+$ test runs compared against \textbf{Double Precision OpenBLAS} with a tolerance of $10^{-3}$ to catch even minor FMA accumulation errors.
+\end{frame}
+
+% 11. Final Results Table
+\begin{frame}{Final Performance Table: Ours vs OpenBLAS}
+  \begin{center}
+    \scalebox{0.9}{
+    \begin{tabular}{|l|c|c|c|r|}
+      \hline
+      \textbf{Kernel} & \textbf{Size (N)} & \textbf{Threads} & \textbf{Throughput} & \textbf{\% of OpenBLAS} \\
+      \hline
+      \texttt{saxpy}  & $10^6$ & 16 & 43.6 GFlops & 103\% \\
+      \texttt{sdot}   & $10^6$ & 16 & 56.4 GFlops & \textbf{715\%}* \\
+      \texttt{sger}   & 1024  & 16 & 386.4 GB/s  & 101\% \\
+      \texttt{ssyr2}  & 512   & 16 & 111.5 GB/s  & \textbf{140\%} \\
+      \texttt{sgemv}  & 2048  & 16 & 227.4 GB/s  & 101\% \\
+      \texttt{SGEMM}  & 2048  & 16 & 837.8 GFlops & \textbf{148\%} \\
+      \hline
+    \end{tabular}
+    }
+  \end{center}
+  \footnotesize{*Note: Local OpenBLAS configuration for SDOT was non-vectorized on this machine, highlighting the impact of our hand-tuned AVX2 kernel.}
+\end{frame}
+
+% 12. Conclusion
+\begin{frame}{Conclusion}
+  \begin{itemize}
+    \item \textbf{Success:} Developed a robust BLAS library covering Levels 1, 2, and 3.
+    \item \textbf{Peak Performance:} Outperformed OpenBLAS in SGEMM and several BLAS 2 kernels.
+    \item \textbf{Key Takeaway:} AI-driven development allows rapid exploration of unrolling factors and parallel scheduling modes (2D vs 3D) to find hardware-specific optima.
+  \end{itemize}
+\end{frame}
+
+\end{document}

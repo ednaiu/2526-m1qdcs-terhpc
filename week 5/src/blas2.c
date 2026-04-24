@@ -56,7 +56,9 @@ void sgemv(char trans, int m, int n, float alpha, const float *a, int lda,
 
     if (!ta) {
         /* --- NoTrans: y[i] += alpha * dot(A[i,:], x) --- */
-        #pragma omp parallel for schedule(static)
+        #pragma omp parallel
+        #pragma omp single
+        #pragma omp taskloop grainsize(1)
         for (int i = 0; i < m; i++) {
             const float *Ar = a + (size_t)i * lda;
             float sum = 0.0f;
@@ -110,7 +112,9 @@ void sger(int m, int n, float alpha, const float *x, int incx,
 {
     if (m <= 0 || n <= 0 || alpha == 0.0f) return;
 
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel
+    #pragma omp single
+    #pragma omp taskloop grainsize(8)
     for (int i = 0; i < m; i++) {
         float axi = alpha * x[i * incx];
         float *Ar = a + (size_t)i * lda;

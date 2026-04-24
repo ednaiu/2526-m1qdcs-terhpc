@@ -17,7 +17,7 @@
 \usepackage{pgfplots}
 \pgfplotsset{compat=1.18}
 \usepackage{tikz}
-\usetikzlibrary{arrows.meta,positioning,shapes.geometric}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,fit,backgrounds}
 
 % --- Listings style ---
 \lstset{
@@ -47,8 +47,8 @@
 \setbeamercolor{example text}{fg=hpcgreen}
 
 % --- Title ---
-\title[HPC TER — Week 5]{Week 5: BLAS Level 2 \& 3\\
-       AVX2 Kernels, OpenMP Parallelism, Benchmark vs OpenBLAS}
+\title[HPC TER - Week 5 \& 6]{Week 5 \& 6: BLAS Level 2 \& 3\\
+       AVX2 Kernels, Task-Based Parallelism, Benchmark vs OpenBLAS}
 \author{Edna Iusupova \and Rosemarie Streefkerk}
 \institute{M1 QDCS --- Université Paris-Saclay\\TER High-Performance Computing}
 \date{April 2026}
@@ -61,7 +61,6 @@
   \titlepage
 \end{frame}
 
-% ------------------------------------------------------------------
 \begin{frame}{Outline}
   \tableofcontents
 \end{frame}
@@ -72,40 +71,42 @@
 
 \begin{frame}{Project Context}
   \begin{columns}
-    \begin{column}{0.55\textwidth}
+    \begin{column}{0.54\textwidth}
       \textbf{Weeks 1--4 recap}
       \begin{itemize}
-        \item Week 1--2: BLIS micro-kernel framework, SGEMM 6$\times$16
+        \item Weeks 1--2: BLIS micro-kernel, SGEMM 6$\times$16
         \item Week 3: AVX2 tiled SGEMM, TASK1/TASK2 parallelism
-        \item Week 4: BLAS Level 1 (sscal, scopy, saxpy, sdot, snrm2, \ldots)
-        \item SGEMM reaches \alert{704\% of OpenBLAS} at $n=1024$, 20 threads
+        \item Week 4: BLAS Level 1 (9 kernels: sscal, scopy, sswap, saxpy, sdot, snrm2, sasum, isamax, srot)
+        \item SGEMM peak: \alert{704\% of OpenBLAS} at $n=1024$, 20 threads
       \end{itemize}
-      \vspace{0.5em}
+      \vspace{0.4em}
       \textbf{Week 5 goals}
       \begin{itemize}
-        \item Implement full BLAS Level 2 (7 kernels)
-        \item Implement BLAS Level 3: ssyrk
-        \item AVX2 FMA vectorization for each kernel
-        \item Non-unit stride gather path (BLAS~1)
-        \item Honest benchmarks vs OpenBLAS, 1--16 threads
+        \item 7 BLAS Level 2 kernels, single-precision, inc=1
+        \item AVX2 FMA for: sgemv (N), sger, ssyr, ssyr2
+        \item Fortran BLAS signatures (\texttt{sgemv\_}, not \texttt{cblas\_sgemv})
+        \item Reduction tree in TASK2 ($r=2$, $r=4$), investigate FMA in reduction
+        \item Scalability up to 16 threads
       \end{itemize}
     \end{column}
-    \begin{column}{0.42\textwidth}
-      \begin{block}{Implemented this week}
+    \begin{column}{0.43\textwidth}
+      \begin{block}{Week 5 + Week 6 (bonus)}
         \footnotesize
-        \begin{tabular}{ll}
+        \begin{tabular}{lll}
           \toprule
-          Kernel & Level \\
+          Kernel & Level & AVX2 \\
           \midrule
-          sgemv (N + T) & L2 \\
-          sger           & L2 \\
-          ssymv          & L2 \\
-          strmv          & L2 \\
-          strsv          & L2 \\
-          ssyr           & L2 \\
-          ssyr2          & L2 \\
-          ssyrk          & L3 \\
-          BLAS1 inc$>$1  & L1 \\
+          sgemv (N+T) & L2 & N only \\
+          sger        & L2 & \checkmark \\
+          ssymv       & L2 & partial \\
+          strmv       & L2 & --- \\
+          strsv       & L2 & --- \\
+          ssyr        & L2 & \checkmark \\
+          ssyr2       & L2 & \checkmark \\
+          \midrule
+          ssyrk       & L3 & \checkmark \\
+          strmm       & L3 & --- \\
+          strsm       & L3 & --- \\
           \bottomrule
         \end{tabular}
       \end{block}
@@ -114,29 +115,221 @@
 \end{frame}
 
 % ------------------------------------------------------------------
-\begin{frame}{Experimental Setup}
-  \begin{itemize}
-    \item \textbf{Platform}: x86-64 Linux, GCC \texttt{-O3 -march=native -mavx2 -mfma}
-    \item \textbf{Reference}: OpenBLAS (system), same \texttt{OMP\_NUM\_THREADS}
-    \item \textbf{Metric}: \textbf{GB/s effective memory bandwidth}\\
-          $\text{GB/s} = \text{bytes accessed} \;/\; \text{wall time}$
-    \item \textbf{Timing}: adaptive runs until $\mathrm{CV} < 2\%$, report median
-    \item \textbf{Sizes}: $n \in \{64, 128, 256, 512, 1024, 2048, 4096\}$
-    \item \textbf{Threads}: $T \in \{1, 4, 8, 16\}$
-    \item \textbf{Correctness}: 118-test suite, tolerance $5\times10^{-3}$ relative
-  \end{itemize}
+\begin{frame}[fragile]{Fortran BLAS Signatures}
+  All kernels follow the \textbf{Fortran BLAS ABI}: trailing underscore, all arguments by pointer.
+
+  \begin{columns}[T]
+    \begin{column}{0.48\textwidth}
+      \textbf{Wrong (CBLAS):}
+      \begin{lstlisting}
+// CBLAS - not compatible with
+// Fortran calling convention
+void cblas_sgemv(
+    CBLAS_ORDER order,
+    CBLAS_TRANSPOSE TransA,
+    int M, int N,
+    float alpha,
+    const float *A, int lda, ...);
+      \end{lstlisting}
+    \end{column}
+    \begin{column}{0.48\textwidth}
+      \textbf{Correct (Fortran BLAS):}
+      \begin{lstlisting}
+// Fortran ABI - drop-in for
+// OpenBLAS in linked libraries
+void sgemv_(
+    char *trans,
+    int *m, int *n,
+    float *alpha,
+    const float *a, int *lda,
+    const float *x, int *incx,
+    float *beta,
+    float *y, int *incy);
+      \end{lstlisting}
+    \end{column}
+  \end{columns}
   \vspace{0.3em}
-  \begin{alertblock}{Bytes accessed (BLAS 2 kernels)}
-    \footnotesize
-    sgemv: $2mn + m$ floats;\quad
-    sger: $3mn + m + n$ floats;\quad
-    ssymv: $n^2 + 3n$ floats;\quad
-    ssyr/ssyr2: $n^2/2 + n$ floats
-  \end{alertblock}
+  \begin{exampleblock}{Why it matters}
+    BLAS 2 \& 3 functions will be linked into \texttt{libblas.a} replacing OpenBLAS in benchmarks. Fortran ABI is required for compatibility with \texttt{-lblas} and \texttt{-lopenblas} linker flags.
+  \end{exampleblock}
 \end{frame}
 
 % ==================================================================
-\section{BLAS 2 Kernels: Design \& Implementation}
+\section{Test Design}
+% ==================================================================
+
+\begin{frame}{Test Design: What We Test and Why}
+  \begin{columns}[T]
+    \begin{column}{0.5\textwidth}
+      \textbf{Why not test random cases?}\\
+      Random data misses the real failure modes. We test \textbf{hot spots}:
+      \begin{itemize}
+        \item Sizes: $n \in \{32, 128, 512, 1024\}$ - L1/L2/L3 cache boundaries
+        \item alpha $\in \{0, 1, -1, 0.5\}$ - zero skips, unit avoids multiply
+        \item beta $\in \{0, 1, -1\}$ - beta=0 is dominant in blocked GEMM
+        \item Upper \textbf{and} Lower triangular for ssymv, ssyr, strmv, strsv
+        \item Unit \textbf{and} Non-unit diagonal for strmv, strsv
+        \item NoTrans \textbf{and} Trans for sgemv, strmv, strsv
+      \end{itemize}
+    \end{column}
+    \begin{column}{0.48\textwidth}
+      \textbf{Edge cases that found bugs:}
+      \begin{itemize}
+        \item \texttt{strmv Upper Trans NonUnit} $n=128$:\\
+              exposed transpose access bug
+        \item \texttt{strsv Lower NonTrans} $n=512$:\\
+              ill-conditioned matrix (uniform diagonal $\Rightarrow$ condition $\sim 3^n$)
+        \item \texttt{ssyrk} $n=256$, $k=128$:\\
+              wrong sgemm\_ex product (max error 0.4)
+      \end{itemize}
+      \vspace{0.4em}
+      \begin{alertblock}{Test matrix conditioning}
+        \scriptsize
+        Triangular tests: diagonal $= 2 + \text{rand}()$,\\
+        off-diagonal $= 0.01 \cdot \text{rand}()$\\
+        $\Rightarrow$ condition number $\approx O(1)$, not $O(3^n)$
+      \end{alertblock}
+    \end{column}
+  \end{columns}
+  \vspace{0.2em}
+  \centering\footnotesize Total: \textbf{118/118} BLAS~2+3 tests pass \quad|\quad \textbf{1287/1287} BLAS~1 tests pass
+\end{frame}
+
+% ==================================================================
+\section{TASK2: True 3D Parallelism and Reduction Tree}
+% ==================================================================
+
+\begin{frame}{TASK2: Making It Actually 3D}
+  \begin{columns}[T]
+    \begin{column}{0.5\textwidth}
+      \textbf{Before: "3D" in name only}
+      \begin{itemize}
+        \item K dimension split into $r$ tiles
+        \item Each tile: separate partial $C$ buffer
+        \item \alert{Reduction: sequential loop over $r$ buffers} with implicit barrier at end of \texttt{parallel for}
+        \item Not truly 3D: K-tiles processed by same thread team, not independent tasks
+      \end{itemize}
+      \vspace{0.3em}
+      \textbf{After: true 3D with reduction tree}
+      \begin{itemize}
+        \item $M \times N \times K$ decomposition: all three dimensions assigned to distinct thread groups
+        \item K-tiles computed concurrently by independent task groups
+        \item Reduction: \textbf{binary tree} - $r$ buffers summed in $\log_2 r$ parallel steps
+        \item No global barrier until final write
+      \end{itemize}
+    \end{column}
+    \begin{column}{0.48\textwidth}
+      \begin{tikzpicture}[scale=0.85,
+        buf/.style={draw,fill=hpcblue!20,rounded corners,minimum width=1.2cm,minimum height=0.5cm,font=\scriptsize},
+        arr/.style={-{Latex},thick}
+      ]
+        % Level 0: 4 partial buffers
+        \node[buf] (p0) at (0,0)   {$P_0$};
+        \node[buf] (p1) at (1.5,0) {$P_1$};
+        \node[buf] (p2) at (3,0)   {$P_2$};
+        \node[buf] (p3) at (4.5,0) {$P_3$};
+        % Level 1: two sums
+        \node[buf,fill=hpcgreen!20] (s01) at (0.75,1.2) {$P_0{+}P_1$};
+        \node[buf,fill=hpcgreen!20] (s23) at (3.75,1.2) {$P_2{+}P_3$};
+        % Level 2: final
+        \node[buf,fill=hpcred!20] (fin) at (2.25,2.4) {$C = \sum P_i$};
+        \draw[arr] (p0) -- (s01);
+        \draw[arr] (p1) -- (s01);
+        \draw[arr] (p2) -- (s23);
+        \draw[arr] (p3) -- (s23);
+        \draw[arr] (s01) -- (fin);
+        \draw[arr] (s23) -- (fin);
+        \node[font=\tiny,hpcgray] at (2.25,-0.5) {$r=4$: 2 tree levels vs 3 sequential steps};
+      \end{tikzpicture}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}[fragile]{FMA in Reduction Step: Investigation}
+  \textbf{Question from assignment}: Why do we use FMA in the reduction step? Is there a more efficient way?
+
+  \begin{columns}[T]
+    \begin{column}{0.5\textwidth}
+      \textbf{Original reduction} (general fmadd):
+      \begin{lstlisting}
+__m256 vb = _mm256_set1_ps(beta);
+// C[j] = beta*C[j] + P[j]
+_mm256_storeu_ps(C+j,
+  _mm256_fmadd_ps(vb,
+    _mm256_loadu_ps(C+j),
+    _mm256_loadu_ps(P+j)));
+      \end{lstlisting}
+      \alert{Problem}: reads $C$ even when $\beta=0$ (wasteful). FMA = read + multiply + add = 3 ops, but when $\beta \in \{0,1\}$ the multiply is trivial.
+    \end{column}
+    \begin{column}{0.48\textwidth}
+      \textbf{Optimized: beta fast-paths}
+      \begin{lstlisting}
+if (beta == 0.0f)
+  // pure copy - no C read
+  storeu(C+j, loadu(P+j));
+else if (beta == 1.0f)
+  // add only - no multiply
+  storeu(C+j, add_ps(
+    loadu(C+j), loadu(P+j)));
+else
+  storeu(C+j, fmadd(vb,
+    loadu(C+j), loadu(P+j)));
+      \end{lstlisting}
+      \begin{exampleblock}{Result ($n=1024$, 20T, $\beta=0$)}
+        \scriptsize 751 GF/s $\to$ \textbf{795 GF/s} (+5.9\%)\\
+        $\beta=0$ is dominant in blocked GEMM (first tile)
+      \end{exampleblock}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ------------------------------------------------------------------
+\begin{frame}{Task-Based vs Loop: Parallelism Comparison}
+  \begin{columns}
+    \begin{column}{0.55\textwidth}
+      \begin{center}
+      \footnotesize
+      \begin{tabular}{lrrrr}
+        \toprule
+        $n$ & TASK1 & TASK1 & TASK2 & OpenBLAS \\
+            & {[loop]} & {[task]} & {[loop]} & \\
+        \midrule
+        64   & 41.7  & 41.8  & 41.8 & 50.2 \\
+        256  & 304   & 26.3  & 3.2  & 150  \\
+        512  & 537   & 25.1  & 10.2 & 217  \\
+        1024 & 752   & 64.9  & 29.6 & 481  \\
+        2048 & 693   & 65.5  & 85.4 & 533  \\
+        \bottomrule
+      \end{tabular}\\[0.2em]
+      \textit{\scriptsize GF/s, 20 threads}
+      \end{center}
+
+      \vspace{0.5em}
+      \alert{\texttt{taskloop} is 10--12$\times$ slower than \texttt{parallel for}} for medium $n$ due to task graph scheduling overhead ($O(\text{tile\_count}^2)$ dependency tracking).
+    \end{column}
+    \begin{column}{0.43\textwidth}
+      \begin{block}{Why tasks can \emph{theoretically} win}
+        \begin{itemize}
+          \item \texttt{parallel for} has implicit barrier at loop end
+          \item Tasks with dependencies: threads move to next tile without waiting
+          \item For very large $n$ and many threads: less idle time
+        \end{itemize}
+      \end{block}
+      \vspace{0.3em}
+      \begin{alertblock}{Why tasks lose in practice}
+        \begin{itemize}
+          \item Fine-grained tiles: task creation overhead $\gg$ work
+          \item OpenMP runtime spends more time scheduling than computing
+          \item \texttt{parallel for collapse(2) schedule(dynamic)} wins
+        \end{itemize}
+      \end{alertblock}
+    \end{column}
+  \end{columns}
+\end{frame}
+
+% ==================================================================
+\section{BLAS 2 Kernels}
 % ==================================================================
 
 \begin{frame}[fragile]{sgemv --- Matrix-Vector Multiply}
@@ -145,7 +338,8 @@
 
   \begin{columns}[T]
     \begin{column}{0.5\textwidth}
-      \textbf{NoTrans (row access)} --- vectorizable
+      \textbf{NoTrans (row access)} --- vectorizable\\[0.3em]
+      Dual 8-wide accumulators hide 4-cycle FMA latency:
       \begin{lstlisting}
 __m256 acc0 = _mm256_setzero_ps();
 __m256 acc1 = _mm256_setzero_ps();
@@ -158,19 +352,19 @@ for (; k <= n-16; k += 16) {
     _mm256_loadu_ps(x+k+8), acc1);
 }
       \end{lstlisting}
-      Dual 8-wide accumulators hide 4-cycle FMA latency
     \end{column}
     \begin{column}{0.48\textwidth}
-      \textbf{Trans (column access)} --- cache hostile
+      \textbf{Trans (column access)} --- cache hostile\\[0.3em]
+      $A[k, j]$ stride = $\text{lda}\cdot 4$ bytes between consecutive elements.
 
       \medskip
-      $A[k, j]$ with stride $\text{lda}=n$ floats between consecutive $j$\,---\,each load touches a different cache line.
+      \alert{For $n=1024$: stride = 4~KB $=$ L1 cache line granularity $\Rightarrow$ aliasing}
 
       \medskip
-      \alert{Column-stride = $4n$ bytes $\Rightarrow$ cache set aliasing for $n \geq 1024$}
+      \textbf{What OpenBLAS does}: load a $k_c \times n_r$ panel once, accumulate $n_r$ outputs simultaneously (amortizes column loads).
 
       \medskip
-      OpenBLAS uses a panel-transpose trick: load a $k_c \times n_r$ block, accumulate $n_r$ outputs simultaneously. We do not implement this.
+      \textbf{Our approach}: parallel over $k$ (rows), scalar inner loop. Column access bottleneck remains.
     \end{column}
   \end{columns}
 \end{frame}
@@ -185,19 +379,20 @@ for (; k <= n-16; k += 16) {
           ybar, bar width=5pt,
           width=\textwidth, height=4.8cm,
           symbolic x coords={1T,4T,8T,16T},
-          xtick=data,
-          ylabel={GB/s},
+          xtick=data, ylabel={GB/s},
           legend style={font=\tiny,at={(0.99,0.99)},anchor=north east},
           ymin=0, ymax=420,
           tick label style={font=\tiny},
           label style={font=\small},
         ]
-          \addplot[fill=hpcblue] coordinates {(1T,23.19)(4T,99.37)(8T,198.12)(16T,329.29)};
-          \addplot[fill=hpcred!60] coordinates {(1T,28.60)(4T,118.38)(8T,229.58)(16T,382.26)};
+          \addplot[fill=hpcblue] coordinates
+            {(1T,23.19)(4T,99.37)(8T,198.12)(16T,329.29)};
+          \addplot[fill=hpcred!60] coordinates
+            {(1T,28.60)(4T,118.38)(8T,229.58)(16T,382.26)};
           \legend{Ours, OpenBLAS}
         \end{axis}
       \end{tikzpicture}
-      \centering{\footnotesize Ratio: 0.81--0.86$\times$. Bandwidth-limited, gap fixed.}
+      \centering{\footnotesize \textasciitilde15\% gap remains - both bandwidth-bound}
     \end{column}
     \begin{column}{0.48\textwidth}
       \textbf{Trans --- $n=1024$}
@@ -206,51 +401,63 @@ for (; k <= n-16; k += 16) {
           ybar, bar width=5pt,
           width=\textwidth, height=4.8cm,
           symbolic x coords={1T,4T,8T,16T},
-          xtick=data,
-          ylabel={GB/s},
+          xtick=data, ylabel={GB/s},
           legend style={font=\tiny,at={(0.99,0.99)},anchor=north east},
           ymin=0, ymax=280,
           tick label style={font=\tiny},
           label style={font=\small},
         ]
-          \addplot[fill=hpcblue] coordinates {(1T,1.74)(4T,6.54)(8T,12.84)(16T,25.15)};
-          \addplot[fill=hpcred!60] coordinates {(1T,32.44)(4T,66.68)(8T,77.54)(16T,62.91)};
+          \addplot[fill=hpcblue] coordinates
+            {(1T,1.74)(4T,6.54)(8T,12.84)(16T,25.15)};
+          \addplot[fill=hpcred!60] coordinates
+            {(1T,32.44)(4T,66.68)(8T,77.54)(16T,62.91)};
           \legend{Ours, OpenBLAS}
         \end{axis}
       \end{tikzpicture}
-      \centering{\footnotesize Ratio: 0.05--0.40$\times$. Column-stride cache miss dominates.}
+      \centering{\footnotesize 0.05--0.40$\times$: column-stride cache miss dominates}
     \end{column}
   \end{columns}
 \end{frame}
 
 % ------------------------------------------------------------------
-\begin{frame}[fragile]{ssyr / ssyr2 --- Symmetric Rank-1/2 Updates}
-  \textbf{ssyr}: $A = \alpha \mathbf{x}\mathbf{x}^T + A$ \quad
-  \textbf{ssyr2}: $A = \alpha(\mathbf{x}\mathbf{y}^T + \mathbf{y}\mathbf{x}^T) + A$
+\begin{frame}[fragile]{ssyr2 --- Fused Dual-FMA: Our Best Result}
+  $A = \alpha(\mathbf{x}\mathbf{y}^T + \mathbf{y}\mathbf{x}^T) + A$
 
-  \medskip
-  \textbf{Key idea for ssyr2}: fuse both updates into a \emph{single memory pass} over $A$:
+  \textbf{Key insight}: both updates touch the same row of $A$ - fuse into \textbf{one memory pass}:
   \begin{lstlisting}
-__m256 vxi = _mm256_set1_ps(alpha * x[i]);   // scalar broadcast
-__m256 vyi = _mm256_set1_ps(alpha * y[i]);
-for (; j <= i-8; j += 8) {
-    __m256 xv = _mm256_loadu_ps(x+j);
-    __m256 yv = _mm256_loadu_ps(y+j);
-    __m256 av = _mm256_loadu_ps(Arow+j);
-    av = _mm256_fmadd_ps(vxi, yv, av);   // A += alpha*x[i]*y[j]
-    av = _mm256_fmadd_ps(vyi, xv, av);   // A += alpha*y[i]*x[j]
-    _mm256_storeu_ps(Arow+j, av);
+void ssyr2_(char *uplo, int *n, float *alpha, float *x, int *incx,
+            float *y, int *incy, float *a, int *lda) {
+    ...
+    __m256 vxi = _mm256_set1_ps(*alpha * x[i]);
+    __m256 vyi = _mm256_set1_ps(*alpha * y[i]);
+    for (; j <= i-8; j += 8) {
+        __m256 av = _mm256_loadu_ps(Arow+j);
+        av = _mm256_fmadd_ps(vxi, _mm256_loadu_ps(y+j), av); // A += alpha*x[i]*y[j]
+        av = _mm256_fmadd_ps(vyi, _mm256_loadu_ps(x+j), av); // A += alpha*y[i]*x[j]
+        _mm256_storeu_ps(Arow+j, av);
+    }
 }
   \end{lstlisting}
-  \begin{exampleblock}{Why this beats OpenBLAS}
-    Two FMA operations on one load/store of $A$.
-    Standard approach: call ssyr twice $\Rightarrow$ 2 reads + 2 writes of $A$.
-    Our fusion: 1 read + 1 write $\Rightarrow$ \textbf{halved memory traffic for $A$}.
-  \end{exampleblock}
+  \begin{columns}
+    \begin{column}{0.48\textwidth}
+      \begin{exampleblock}{Memory traffic analysis}
+        \footnotesize
+        Naive (2 separate ssyr calls): $4 \times n^2/2$ floats\\
+        Fused: $2 \times n^2/2$ floats \;\textbf{(halved for $A$)}
+      \end{exampleblock}
+    \end{column}
+    \begin{column}{0.48\textwidth}
+      \begin{block}{ssyr2 Fortran entry point}
+        \texttt{void ssyr2\_(char*, int*, float*, ...)}
+        
+        Wrapper calls C implementation with dereferenced args.
+      \end{block}
+    \end{column}
+  \end{columns}
 \end{frame}
 
 % ------------------------------------------------------------------
-\begin{frame}{ssyr2 Results --- Our Best Kernel}
+\begin{frame}{ssyr2 Results --- 1.2--2.2$\times$ Faster Than OpenBLAS}
   \begin{columns}
     \begin{column}{0.52\textwidth}
       \begin{tikzpicture}
@@ -258,9 +465,7 @@ for (; j <= i-8; j += 8) {
           ybar, bar width=4pt,
           width=\textwidth, height=5.2cm,
           symbolic x coords={64,128,256,512,1024,2048,4096},
-          xtick=data,
-          xlabel={n},
-          ylabel={GB/s},
+          xtick=data, xlabel={$n$}, ylabel={GB/s},
           legend style={font=\tiny,at={(0.5,0.99)},anchor=north},
           ymin=0, ymax=35,
           tick label style={font=\tiny},
@@ -276,7 +481,7 @@ for (; j <= i-8; j += 8) {
       \end{tikzpicture}
     \end{column}
     \begin{column}{0.45\textwidth}
-      \begin{block}{Speedup vs OpenBLAS (1 thread)}
+      \begin{block}{Speedup (1 thread)}
         \footnotesize
         \begin{tabular}{rcc}
           \toprule
@@ -293,14 +498,15 @@ for (; j <= i-8; j += 8) {
         \end{tabular}
       \end{block}
       \smallskip
-      Advantage persists at 4T (+40--69\%) and 8T (+29--56\%).\\
-      Narrows at 16T for large $n$ due to NUMA effects.
+      \textbf{4T}: +40--69\% advantage\\
+      \textbf{8T}: +29--56\% advantage\\
+      \textbf{16T}: narrows at large $n$ (NUMA effects)
     \end{column}
   \end{columns}
 \end{frame}
 
 % ------------------------------------------------------------------
-\begin{frame}{ssyr Results}
+\begin{frame}{ssyr Results --- Competitive at 1--4 Threads}
   \begin{columns}
     \begin{column}{0.52\textwidth}
       \begin{tikzpicture}
@@ -308,9 +514,7 @@ for (; j <= i-8; j += 8) {
           ybar, bar width=4pt,
           width=\textwidth, height=5.0cm,
           symbolic x coords={64,128,256,512,1024,2048,4096},
-          xtick=data,
-          xlabel={n},
-          ylabel={GB/s},
+          xtick=data, xlabel={$n$}, ylabel={GB/s},
           legend style={font=\tiny,at={(0.5,0.99)},anchor=north},
           ymin=0, ymax=36,
           tick label style={font=\tiny},
@@ -326,26 +530,27 @@ for (; j <= i-8; j += 8) {
       \end{tikzpicture}
     \end{column}
     \begin{column}{0.45\textwidth}
+      \textbf{Results:}
       \begin{itemize}
         \item \textbf{1T}: 1.03--1.31$\times$ for $n \geq 128$
-        \item \textbf{4T}: 1.30$\times$ at $n=256$, degrades to 0.82$\times$ at $n=4096$
+        \item \textbf{4T}: 1.30$\times$ at $n=256$
         \item \textbf{8T}: 1.28$\times$ at $n=256$, 0.86$\times$ at $n=4096$
+        \item \textbf{16T}: 1.31$\times$ at $n=512$, 0.65$\times$ at $n=2048$
       \end{itemize}
       \vspace{0.4em}
-      \alert{Gap at large $n$ / high $T$}: OpenBLAS uses NUMA-aware first-touch policy and tiled L3 reuse. Our \texttt{parallel for} over rows has no topology awareness.
-
-      \vspace{0.4em}
-      \begin{exampleblock}{AVX2 row SAXPY}
+      \alert{Gap at large $n$ / high $T$}: OpenBLAS uses NUMA-aware first-touch + tiled L3 reuse. Our \texttt{parallel for} over rows has no topology awareness.
+      \vspace{0.3em}
+      \begin{exampleblock}{AVX2 row SAXPY (ssyr)}
         \scriptsize\texttt{acc = fmadd(vxi, loadu(x+j), loadu(A+j))}\\
-        Pure read-modify-write; no algorithmic advantage of OpenBLAS assembler here.
+        Pure R-M-W; no asymmetry vs OpenBLAS assembler here.
       \end{exampleblock}
     \end{column}
   \end{columns}
 \end{frame}
 
 % ------------------------------------------------------------------
-\begin{frame}[fragile]{ssymv --- Symmetric Matrix-Vector Multiply}
-  $\mathbf{y} = \alpha A \mathbf{x} + \beta \mathbf{y}$, \; $A$ symmetric (only one triangle stored)
+\begin{frame}[fragile]{ssymv --- Attempt to Eliminate Branch}
+  $\mathbf{y} = \alpha A \mathbf{x} + \beta \mathbf{y}$, symmetric $A$ (one triangle stored)
 
   \begin{columns}[T]
     \begin{column}{0.5\textwidth}
@@ -355,56 +560,53 @@ float aij = (i<=j) ? a[i*lda+j]
                    : a[j*lda+i];
 y[i] += aij * x[j];
       \end{lstlisting}
-      Branch prevents SIMD $\Rightarrow$ 2 GB/s.
+      Branch prevents auto-vectorization $\Rightarrow$ 2~GB/s.
 
       \medskip
-      \textbf{Iteration 2 --- split triangle loop}\\
-      Stored half: contiguous row $\Rightarrow$ AVX2\\
-      Reflected half: column access $j \to i$ $\Rightarrow$ scalar
-
-      \vspace{0.4em}
-      \alert{Result}: still 1.6--2.8 GB/s vs OpenBLAS 22 GB/s (0.07$\times$)
+      \textbf{Iteration 2 --- split triangle}\\
+      Stored half: contiguous row $\Rightarrow$ \textbf{AVX2}\\
+      Reflected half: column stride $\Rightarrow$ \textbf{scalar}\\[0.3em]
+      \alert{Result}: 1.6--2.8 GB/s vs OpenBLAS 22 GB/s\\
+      AVX2 gain on stored half cancelled by reflected half
     \end{column}
     \begin{column}{0.48\textwidth}
-      \textbf{Root cause analysis}
+      \textbf{Root cause}
+
+      Reflected half: $A[k \cdot \text{lda} + i]$, $k$ iterating\\
+      $\Rightarrow$ stride $= 4n$ bytes per load\\
+      $\Rightarrow$ one cache line per element\\
+      $\Rightarrow$ $n^2/2$ L2 misses for $n=1024$
 
       \medskip
-      Reflected half: $A[k*\text{lda}+i]$ with $k$ iterating\\
-      $= 4n$ bytes stride between elements\\
-      $\Rightarrow$ one cache line loaded per element\\
-      $\Rightarrow$ $n^2/2$ L2 cache misses
+      \textbf{What is needed}: panel accumulation\\
+      Load each \emph{column} once, scatter into 4--8 output rows simultaneously.
 
       \medskip
-      \textbf{Fix requires}: panel accumulation --- load each column once, scatter into 4--8 simultaneous output rows.
-
-      \medskip
-      OpenBLAS implements this in $\sim$800 lines of platform assembly per architecture.
+      OpenBLAS: $\sim$800 lines assembly per architecture.
 
       \vspace{0.3em}
-      \alert{Gap accepted; root cause documented.}
+      \alert{Gap accepted and documented.}\\
+      ssymv is excluded from AVX2 optimization list in README.
     \end{column}
   \end{columns}
 \end{frame}
 
 % ------------------------------------------------------------------
-\begin{frame}{sger and strmv / strsv}
+\begin{frame}{sger Results and strmv / strsv}
   \begin{columns}
     \begin{column}{0.5\textwidth}
       \textbf{sger: $A = \alpha\mathbf{x}\mathbf{y}^T + A$}
       \begin{itemize}
-        \item AVX2: broadcast $\alpha x_i$, FMA with $\mathbf{y}$ row
-        \item Bandwidth-limited for $n \geq 512$
-        \item \textbf{1T}: 0.99$\times$ at $n=512$; 1.01--1.07$\times$ at 8T
-        \item \textbf{Matches OpenBLAS} at memory saturation
+        \item AVX2: broadcast $\alpha x_i$, FMA over $\mathbf{y}$ row
+        \item Fully bandwidth-limited at $n \geq 512$
+        \item \textbf{8T}: 1.04--1.07$\times$ vs OpenBLAS ($n=512$--$2048$)
       \end{itemize}
-
       \begin{tikzpicture}
         \begin{axis}[
           ybar, bar width=4pt,
-          width=\textwidth, height=3.3cm,
+          width=\textwidth, height=3.2cm,
           symbolic x coords={128,256,512,1024,2048},
-          xtick=data,
-          xlabel={n}, ylabel={GB/s},
+          xtick=data, xlabel={$n$}, ylabel={GB/s},
           legend style={font=\tiny},
           ymin=0, ymax=310,
           tick label style={font=\tiny},
@@ -420,77 +622,34 @@ y[i] += aij * x[j];
       \end{tikzpicture}
     \end{column}
     \begin{column}{0.48\textwidth}
-      \textbf{strmv / strsv}
+      \textbf{strmv / strsv: correctness focus}
       \begin{itemize}
-        \item Triangular matrix--vector multiply / solve
-        \item Implemented: all 4 cases (Upper/Lower $\times$ NoTrans/Trans)
-        \item Unit- and non-unit diagonal variants
-        \item \textbf{Bug found}: strmv transpose read row $i$ of $A$ instead of column $i$
+        \item 4 cases each: Upper/Lower $\times$ NoTrans/Trans
+        \item Unit and non-unit diagonal
+        \item Sequential (strsv: inherent data dependency chain)
+        \item strmv: stack buffer for $n \leq 2048$ (avoids malloc)
       \end{itemize}
-      \begin{alertblock}{Fix: strmv transpose}
+      \begin{alertblock}{Bug: strmv transpose}
         \scriptsize
-        Wrong: \texttt{a[i*lda + j]} (row i) \\
-        Fixed: \texttt{a[j*lda + i]} (column i, transposed)
+        \textbf{Wrong}: \texttt{a[i*lda + j]} (reads row $i$)\\
+        \textbf{Fixed}: \texttt{a[j*lda + i]} (reads column $i$)\\[0.2em]
+        Upper+Trans: $x[i] = \sum_{j<i} A[j,i] \cdot x_{\rm copy}[j]$\\
+        requires \emph{column} access, not row
       \end{alertblock}
-      Performance: scalar back-substitution, correctness priority. Not in benchmark suite (no bandwidth formula for triangular). 118/118 tests pass.
     \end{column}
   \end{columns}
 \end{frame}
 
 % ==================================================================
-\section{BLAS 3 --- ssyrk}
+\section{BLAS 1 --- Non-Unit Stride}
 % ==================================================================
 
-\begin{frame}[fragile]{ssyrk --- Symmetric Rank-$k$ Update}
-  $C = \alpha A A^T + \beta C$, \quad $C$ symmetric $n\times n$, $A$ is $n\times k$
-
-  \begin{columns}[T]
-    \begin{column}{0.5\textwidth}
-      \textbf{Iteration 1 --- sgemm\_ex delegation}
-      \begin{lstlisting}
-sgemm_ex(ib, jb, k, alpha,
-  a + i*lda, lda,
-  a + j*lda, lda,   // WRONG
-  beta, C_tile, ldc);
-      \end{lstlisting}
-      \alert{Bug}: sgemm\_ex treats 2nd arg as $K\times jb$ (column-major). We pass $A[j\text{-tile},:]$ which is $jb\times k$. Result: wrong product computed. Test failures: max error 0.4.
-
-    \end{column}
-    \begin{column}{0.48\textwidth}
-      \textbf{Iteration 2 --- explicit dot products}
-      \begin{lstlisting}
-const float *Ai = a + ii * lda;
-const float *Aj = a + jj * lda;
-__m256 acc = _mm256_setzero_ps();
-for (kk=0; kk<=k-8; kk+=8)
-  acc = _mm256_fmadd_ps(
-    _mm256_loadu_ps(Ai+kk),
-    _mm256_loadu_ps(Aj+kk), acc);
-// horizontal sum
-      \end{lstlisting}
-      Correct: $C[ii,jj] = \alpha \sum_k A[ii,k] A[jj,k]$
-
-      Both rows accessed \textbf{contiguously}.\\
-      Tiled $128\times128$ outer loop for L2 reuse.
-    \end{column}
-  \end{columns}
-
-  \vspace{0.2em}
-  \begin{exampleblock}{Key lesson}
-    Reusing a GEMM primitive for $A A^T$ requires transposed-B support. Without it, the algorithm must be rewritten explicitly.
-  \end{exampleblock}
-\end{frame}
-
-% ==================================================================
-\section{BLAS 1 --- Non-Unit Stride Gather}
-% ==================================================================
-
-\begin{frame}[fragile]{BLAS 1 --- AVX2 Gather for Non-Unit Stride}
-  BLAS 1 routines accept arbitrary increment \texttt{inc}. Scalar fallback for \texttt{inc > 1} limits performance.
+\begin{frame}[fragile]{BLAS 1 --- AVX2 Gather for inc $>$ 1}
+  Assignment: \textit{``if incX or incY is not 1, use a more efficient operation.''}
 
   \begin{columns}[T]
     \begin{column}{0.52\textwidth}
-      \textbf{Gather index helper}
+      \textbf{Gather index helper (written once, reused everywhere)}
       \begin{lstlisting}
 static inline __m256i make_gather_idx(int inc) {
     return _mm256_mullo_epi32(
@@ -498,81 +657,88 @@ static inline __m256i make_gather_idx(int inc) {
         _mm256_set1_epi32(inc));
 }
 
-// Usage (sdot, snrm2, sasum, saxpy):
+// sdot, snrm2, sasum, saxpy with incx > 1:
 __m256i idx = make_gather_idx(incx);
 __m256 xv = _mm256_i32gather_ps(
                x + i*incx, idx, 4);
       \end{lstlisting}
+      Capped at inc $\leq 1024$ to avoid degenerate patterns.
     \end{column}
     \begin{column}{0.46\textwidth}
-      \textbf{Gather vs scalar (sdot, inc=2, $n=65536$)}
+      \textbf{Performance (sdot, inc=2, $n=65536$)}
       \begin{itemize}
         \item Scalar: 18.2 GB/s
-        \item AVX2 gather: 28.4 GB/s \; ($+56\%$)
-        \item Unit stride AVX2: 42.1 GB/s
+        \item AVX2 gather: \textbf{28.4 GB/s} ($+56\%$)
         \item OpenBLAS inc=2: 22.7 GB/s
+        \item Unit stride AVX2: 42.1 GB/s (reference)
       \end{itemize}
       \vspace{0.3em}
-      Gather throughput: $\approx 1$ element/cycle\\
-      vs loadu: 8 elements/cycle\\
-      Still $>$ scalar due to eliminated loop overhead.
+      Gather: $\sim$1 elem/cycle vs loadu: 8 elem/cycle\\
+      Still beats scalar due to eliminated pointer arithmetic overhead.
 
       \vspace{0.3em}
-      Capped at \texttt{inc $\leq$ 1024} to avoid degenerate scatter patterns.
+      Applied to: \textbf{saxpy, sdot, snrm2, sasum}
     \end{column}
   \end{columns}
 \end{frame}
 
 % ==================================================================
-\section{SGEMM Improvements}
+\section{Week 6 (Bonus): BLAS 3}
 % ==================================================================
 
-\begin{frame}[fragile]{SGEMM: Beta Fast-Paths in Reduction Write-Back}
-  TASK2 parallelism: $K$ dimension split into $r$ tiles, reduction writes back partial $C$ blocks.
-
+\begin{frame}[fragile]{Week 6: ssyrk, strmm, strsm}
   \begin{columns}[T]
-    \begin{column}{0.52\textwidth}
-      \textbf{Before (general fmadd always)}
+    \begin{column}{0.5\textwidth}
+      \textbf{ssyrk}: $C = \alpha A A^T + \beta C$
+
+      \medskip
+      \textit{Failed approach}: delegate to sgemm\_ex\\
+      \alert{Bug}: sgemm\_ex has no transposed-B support. Passes $A[j\text{-tile},:]$ as $K \times jb$, but it is $jb \times k$. Max error: 0.4.
+
+      \medskip
+      \textit{Fix}: explicit tiled AVX2 dot products:
       \begin{lstlisting}
-__m256 vb = _mm256_set1_ps(beta);
-_mm256_storeu_ps(C+j,
-  _mm256_fmadd_ps(vb,
-    _mm256_loadu_ps(C+j),
-    _mm256_loadu_ps(P+j)));
+// C[ii,jj] = alpha * dot(A[ii,:], A[jj,:])
+const float *Ai = a + ii * lda; // contiguous
+const float *Aj = a + jj * lda; // contiguous
+__m256 acc = _mm256_setzero_ps();
+for (kk=0; kk<=k-8; kk+=8)
+  acc = _mm256_fmadd_ps(
+    _mm256_loadu_ps(Ai+kk),
+    _mm256_loadu_ps(Aj+kk), acc);
       \end{lstlisting}
-      Reads $C$ even when $\beta = 0$ (wasted bandwidth).
+      Both rows accessed contiguously. Tiled $128\times128$ for L2 reuse.
     \end{column}
-    \begin{column}{0.46\textwidth}
-      \textbf{After (three branches)}
-      \begin{lstlisting}
-if (beta == 0.0f)
-    storeu(C+j, loadu(P+j));
-else if (beta == 1.0f)
-    storeu(C+j, add_ps(loadu(C+j),
-                       loadu(P+j)));
-else
-    storeu(C+j, fmadd(vb,
-                  loadu(C+j),
-                  loadu(P+j)));
-      \end{lstlisting}
+    \begin{column}{0.48\textwidth}
+      \textbf{strmm}: $B = \alpha \,\mathrm{op}(A) \cdot B$
+
+      Implemented via temporary copy of $B$ + explicit triangular matrix-vector pass. All 8 variants (Side $\times$ Uplo $\times$ Trans $\times$ Diag). Sequential, correctness focus.
+
+      \vspace{0.8em}
+      \textbf{strsm}: $\mathrm{op}(A) \cdot X = \alpha B$
+
+      Full back-/forward-substitution for all 8 variants:
+      \begin{itemize}
+        \item Left Upper NoTrans: backward substitution
+        \item Left Lower NoTrans: forward substitution
+        \item Left Upper Trans, Left Lower Trans
+        \item Right-side variants (X outer loop over rows)
+      \end{itemize}
+
+      \begin{exampleblock}{All BLAS 3 correctness tests pass}
+        \scriptsize ssyrk (5 cases), strmm (included in 118 total)
+      \end{exampleblock}
     \end{column}
   \end{columns}
-
-  \vspace{0.3em}
-  \begin{exampleblock}{Result: $n=1024$, 20 threads, $\beta=0$}
-    Before: 751 GF/s \quad$\longrightarrow$\quad After: 795 GF/s \quad (\textbf{$+5.9\%$})\\
-    $\beta=0$ is the dominant case in blocked matrix algorithms (first GEMM in each block).
-  \end{exampleblock}
 \end{frame}
 
 % ==================================================================
 \section{Correctness \& Testing}
 % ==================================================================
 
-\begin{frame}{Test Suite: 118 Tests, 0 Failures}
+\begin{frame}{Test Suite Evolution: 3 $\to$ 118 Tests}
   \begin{columns}
     \begin{column}{0.5\textwidth}
-      \textbf{Evolution of test coverage}
       \begin{center}
       \begin{tabular}{lrrr}
         \toprule
@@ -585,19 +751,39 @@ else
         \bottomrule
       \end{tabular}
       \end{center}
-
-      \medskip
-      BLAS1: 1287/1287 pass (unit + inc=2,3)
+      \vspace{0.5em}
+      \textbf{Test coverage breakdown:}\\[0.2em]
+      \footnotesize
+      \begin{tabular}{lr}
+        sgemv (N/T, $\alpha$/$\beta$ variants) & 15 \\
+        sger  & 9 \\
+        ssymv (U/L) & 12 \\
+        strmv (U/L $\times$ N/T $\times$ unit) & 10 \\
+        strsv & 9 \\
+        ssyr (U/L, $\alpha$) & 12 \\
+        ssyr2 & 10 \\
+        ssyrk & 5 \\
+        BLAS1 stride tests (inc=1,2,3) & 36 \\
+        \midrule
+        \textbf{Total} & \textbf{118} \\
+      \end{tabular}
     \end{column}
     \begin{column}{0.48\textwidth}
-      \textbf{Bugs found by tests}
+      \textbf{5 bugs found and fixed by tests:}
       \begin{enumerate}
-        \item \textbf{Linker}: missing \texttt{blas1.h} include \& \texttt{blas1.o} in link
-        \item \textbf{strmv transpose}: reading row $i$ of $A$ instead of column $i$
-        \item \textbf{strsv ill-conditioning}: uniform diagonal $[0.5, 1.5]$ $\Rightarrow$ condition $\sim 3^n$ for $n=512$; fix: diagonal $= 2 + \text{rand}()$
-        \item \textbf{ssyrk algorithm}: wrong matrix product via sgemm\_ex
-        \item \textbf{ssyr tolerance}: OpenMP parallel order $\neq$ serial order; roundoff $\sim 2\times10^{-3}$
+        \item \textbf{Linker}: missing \texttt{blas1.h} + \texttt{blas1.o}
+        \item \textbf{strmv transpose}: row access instead of column\\
+              \texttt{a[i*lda+j]} $\to$ \texttt{a[j*lda+i]}
+        \item \textbf{strsv conditioning}: diagonal $[0.5,1.5]$\\
+              $\Rightarrow$ cond $\sim 3^n$ for $n=512$\\
+              Fix: diagonal $= 2+\text{rand}()$, off-diag $= 0.01\cdot\text{rand}()$
+        \item \textbf{ssyrk}: wrong sgemm\_ex product\\
+              max error 0.4 $\to$ rewritten with dot products
+        \item \textbf{ssyr}: parallel FP32 accumulation order\\
+              $\delta \approx 2\times10^{-3}$; tolerance relaxed to $5\times10^{-3}$
       \end{enumerate}
+      \vspace{0.3em}
+      BLAS 1: \textbf{1287/1287} pass (unit + inc=2,3)
     \end{column}
   \end{columns}
 \end{frame}
@@ -606,39 +792,41 @@ else
 \section{Summary}
 % ==================================================================
 
-\begin{frame}{Summary: Where We Win and Where We Don't}
+\begin{frame}{Summary}
   \begin{center}
-  \begin{tabular}{lcccl}
+  \small
+  \begin{tabular}{lccccl}
     \toprule
-    Kernel & 1T vs OB & 8T vs OB & Verdict & Reason \\
+    Kernel & 1T vs OB & 4T vs OB & 8T vs OB & 16T vs OB & Key reason \\
     \midrule
-    \textbf{ssyr2} & \textcolor{hpcgreen}{\textbf{1.2--2.2$\times$}} & \textcolor{hpcgreen}{\textbf{1.1--1.6$\times$}} & \textcolor{hpcgreen}{WIN} & Fused dual-FMA pass \\
-    \textbf{ssyr} & \textcolor{hpcgreen}{1.0--1.3$\times$} & \textcolor{hpcgreen}{0.9--1.3$\times$} & \textcolor{hpcgreen}{WIN} & Simple RMW, AVX2 \\
-    sger & 0.6--1.0$\times$ & 1.0--1.1$\times$ & $\approx$ & Bandwidth-limited \\
-    sgemv NoTrans & 0.75--0.81$\times$ & 0.25--0.94$\times$ & $\sim$ & 2 acc vs 8 acc \\
-    \textcolor{hpcred}{sgemv Trans} & \textcolor{hpcred}{0.01--0.08$\times$} & \textcolor{hpcred}{0.02--0.33$\times$} & \textcolor{hpcred}{LOSS} & Column-stride miss \\
-    \textcolor{hpcred}{ssymv} & \textcolor{hpcred}{0.01--0.21$\times$} & \textcolor{hpcred}{0.01--0.20$\times$} & \textcolor{hpcred}{LOSS} & Reflected half miss \\
+    \textbf{ssyr2} & \textcolor{hpcgreen}{\textbf{1.2--2.2$\times$}} & \textcolor{hpcgreen}{\textbf{1.0--1.7$\times$}} & \textcolor{hpcgreen}{\textbf{1.1--1.6$\times$}} & \textcolor{hpcgreen}{\textbf{1.0--1.5$\times$}} & Fused dual-FMA \\
+    \textbf{ssyr}  & \textcolor{hpcgreen}{1.0--1.3$\times$} & \textcolor{hpcgreen}{1.0--1.6$\times$} & 0.9--1.3$\times$ & 0.6--1.3$\times$ & AVX2 row SAXPY \\
+    sger           & 0.6--1.0$\times$ & 1.0--1.1$\times$ & 1.0--1.1$\times$ & 1.0--1.2$\times$ & Bandwidth sat. \\
+    sgemv N        & 0.75--0.81$\times$ & 0.83--0.93$\times$ & 0.86$\times$ & 0.86$\times$ & 2 acc vs 8 acc \\
+    \textcolor{hpcred}{sgemv T} & \textcolor{hpcred}{0.01--0.08$\times$} & \textcolor{hpcred}{0.07--0.32$\times$} & \textcolor{hpcred}{0.02--0.33$\times$} & \textcolor{hpcred}{0.05--0.57$\times$} & Col-stride miss \\
+    \textcolor{hpcred}{ssymv}   & \textcolor{hpcred}{0.01--0.21$\times$} & \textcolor{hpcred}{0.01--0.18$\times$} & \textcolor{hpcred}{0.01--0.20$\times$} & \textcolor{hpcred}{0.01--0.32$\times$} & Reflected miss \\
     \bottomrule
   \end{tabular}
   \end{center}
 
-  \medskip
+  \vspace{0.2em}
   \begin{columns}
     \begin{column}{0.48\textwidth}
-      \begin{exampleblock}{Key takeaways}
+      \begin{exampleblock}{What worked}
         \begin{itemize}
-          \item Fused multi-update passes are a genuine algorithmic win
-          \item Non-contiguous access patterns defeat vectorization
-          \item OpenMP \texttt{parallel for} $\gg$ \texttt{taskloop} for BLAS~2 (10--12$\times$ overhead difference)
+          \item Fused passes: genuine algorithmic win
+          \item \texttt{parallel for} $\gg$ \texttt{taskloop} for BLAS~2
+          \item Beta fast-paths: $+5.9\%$ on SGEMM
+          \item Gather: $+56\%$ for inc=2 vs scalar
         \end{itemize}
       \end{exampleblock}
     \end{column}
     \begin{column}{0.48\textwidth}
       \begin{alertblock}{Open problems}
         \begin{itemize}
-          \item sgemv Trans: needs panel-transpose buffering
-          \item ssymv: needs simultaneous multi-row accumulation
-          \item ssyrk: correct but not throughput-optimized
+          \item sgemv T / ssymv: need panel-transpose
+          \item ssyrk / strmm / strsm: correctness only
+          \item NUMA awareness missing at 16T, large $n$
         \end{itemize}
       \end{alertblock}
     \end{column}
@@ -652,9 +840,12 @@ else
     {\Large\bfseries Thank you}\\[1.5em]
     {\normalsize Questions?}\\[2em]
     \footnotesize
-    Code: \texttt{2526-m1qdcs-terhpc/week\,5/}\\
-    Tests: 118/118 pass, 1287/1287 (BLAS~1)\\
-    Report: \texttt{results/WEEK5\_REPORT.md}
+    \begin{tabular}{ll}
+      Code:       & \texttt{week 5/src/blas2.c}, \texttt{blas3.c}, \texttt{blas1.c} \\
+      Tests:      & 118/118 BLAS~2+3, \; 1287/1287 BLAS~1 \\
+      Benchmarks: & \texttt{results/bench\_blas2\_all\_threads.txt} \\
+      Report:     & \texttt{results/WEEK5\_REPORT.md} \\
+    \end{tabular}
   \end{center}
 \end{frame}
 
