@@ -23,51 +23,48 @@ void ssyrk(char uplo, char trans, int n, int k, float alpha, const float *a, int
     int upper = (uplo == 'U' || uplo == 'u');
     int ta    = (trans == 'T' || trans == 't' || trans == 'C' || trans == 'c');
 
-    /* Tiling to reuse sgemm */
+        /* Tiled scalar kernel with AVX2 dot product */
     const int block = 128;
 
+    /* Note: our sgemm_ex does not support transposed B, so we cannot call it
+     * directly for C = alpha*A*A^T. We use a tiled scalar kernel which is
+     * correct for all cases. The tiling improves cache reuse over naive O(n^2*k). */
     #pragma omp parallel for collapse(2) schedule(dynamic)
     for (int i = 0; i < n; i += block) {
         for (int j = 0; j < n; j += block) {
             int ib = (i + block <= n) ? block : (n - i);
             int jb = (j + block <= n) ? block : (n - j);
 
-            if (upper) {
-                if (i > j + jb - 1) continue; /* block below triangle */
-            } else {
-                if (j > i + ib - 1) continue; /* block above triangle */
-            }
+            if (upper && i > j + jb - 1) continue;
+            if (!upper && j > i + ib - 1) continue;
 
-            /* If block is fully inside triangle, use sgemm_ex.
-             * If block intersects diagonal, handle carefully or use scalar fallback.
-             */
-            int fully_inside = 0;
-            if (upper && (i + ib - 1 <= j)) fully_inside = 1;
-            if (!upper && (j + jb - 1 <= i)) fully_inside = 1;
-
-            if (fully_inside) {
-                sgemm_config_t cfg = SGEMM_DEFAULT_CONFIG;
-                if (!ta) {
-                    /* C[i,j] = alpha * A[i,:] * A[j,:]^T + beta*C */
-                    sgemm_ex(ib, jb, k, alpha, a + i * lda, lda, a + j * lda, lda, beta, c + i * ldc + j, ldc, &cfg);
-                } else {
-                    /* C[i,j] = alpha * A[:,i]^T * A[:,j] + beta*C */
-                    sgemm_ex(ib, jb, k, alpha, a + i, lda, a + j, lda, beta, c + i * ldc + j, ldc, &cfg);
-                }
-            } else {
-                /* Diagonal-intersecting block: simple scalar version */
-                for (int ii = i; ii < i + ib; ii++) {
-                    for (int jj = j; jj < j + jb; jj++) {
-                        if (upper && ii > jj) continue;
-                        if (!upper && ii < jj) continue;
-                        float s = 0.0f;
-                        for (int kk = 0; kk < k; kk++) {
-                            float aik = (!ta) ? a[ii * lda + kk] : a[kk * lda + ii];
-                            float ajk = (!ta) ? a[jj * lda + kk] : a[kk * lda + jj];
-                            s += aik * ajk;
-                        }
-                        c[ii * ldc + jj] = alpha * s + beta * c[ii * ldc + jj];
+            for (int ii = i; ii < i + ib; ii++) {
+                for (int jj = j; jj < j + jb; jj++) {
+                    if (upper  && ii > jj) continue;
+                    if (!upper && ii < jj) continue;
+                    float s = 0.0f;
+                    if (!ta) {
+                        /* C[ii,jj] = alpha * dot(A[ii,:], A[jj,:]) + beta*C */
+                        const float *Ai = a + (size_t)ii * lda;
+                        const float *Aj = a + (size_t)jj * lda;
+                        int kk = 0;
+                        __m256 acc = _mm256_setzero_ps();
+                        for (; kk <= k - 8; kk += 8)
+                            acc = _mm256_fmadd_ps(_mm256_loadu_ps(Ai+kk),
+                                                  _mm256_loadu_ps(Aj+kk), acc);
+                        /* hsum */
+                        __m128 lo = _mm256_castps256_ps128(acc);
+                        __m128 hi = _mm256_extractf128_ps(acc, 1);
+                        __m128 s4 = _mm_add_ps(lo, hi);
+                        s4 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+                        s4 = _mm_add_ss(s4, _mm_shuffle_ps(s4, s4, 1));
+                        s = _mm_cvtss_f32(s4);
+                        for (; kk < k; kk++) s += Ai[kk] * Aj[kk];
+                    } else {
+                        for (int kk = 0; kk < k; kk++)
+                            s += a[(size_t)kk * lda + ii] * a[(size_t)kk * lda + jj];
                     }
+                    c[(size_t)ii * ldc + jj] = alpha * s + beta * c[(size_t)ii * ldc + jj];
                 }
             }
         }

@@ -47,6 +47,8 @@ SIMPLE_BIN := $(BIN_DIR)/simple_test
 TEST1_BIN  := $(BIN_DIR)/test_blas1
 BENCH1_BIN := $(BIN_DIR)/bench_blas1
 TEST23_BIN := $(BIN_DIR)/test_blas23
+BENCH2_SRC := $(BENCH_DIR)/bench_blas2.c
+BENCH2_BIN := $(BIN_DIR)/bench_blas2
 LIBBLAS    := $(BIN_DIR)/libblas.a
 
 # Targets
@@ -165,7 +167,7 @@ $(BLAS3_OBJ): $(BLAS3_SRC) $(INC_DIR)/blas3.h | $(BIN_DIR)
 $(BIN_DIR)/test_blas23.o: $(TEST23_SRC) $(INC_DIR)/blas2.h $(INC_DIR)/blas3.h | $(BIN_DIR)
 	$(CC) $(CFLAGS) $(OPENBLAS_CFLAGS) -I$(INC_DIR) -c $(TEST23_SRC) -o $@
 
-$(TEST23_BIN): $(BLAS2_OBJ) $(BLAS3_OBJ) $(SGEMM_OBJ) $(BIN_DIR)/test_blas23.o | $(BIN_DIR)
+$(TEST23_BIN): $(BLAS1_OBJ) $(BLAS2_OBJ) $(BLAS3_OBJ) $(SGEMM_OBJ) $(BIN_DIR)/test_blas23.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(OPENBLAS_LDFLAGS)
 
 # BLAS Static Library (All levels)
@@ -184,7 +186,14 @@ blas2: $(BLAS2_OBJ)
 blas3: $(BLAS3_OBJ)
 test-blas1: $(TEST1_BIN)
 test-blas23: $(TEST23_BIN)
+$(BIN_DIR)/bench_blas2.o: $(BENCH2_SRC) $(INC_DIR)/blas2.h $(INC_DIR)/blas3.h | $(BIN_DIR)
+	$(CC) $(CFLAGS) $(OPENBLAS_CFLAGS) -I$(INC_DIR) -c $(BENCH2_SRC) -o $@
+
+$(BENCH2_BIN): $(BLAS2_OBJ) $(BLAS3_OBJ) $(SGEMM_OBJ) $(BIN_DIR)/bench_blas2.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(OPENBLAS_LDFLAGS)
+
 bench-blas1: $(BENCH1_BIN)
+bench-blas2: $(BENCH2_BIN)
 lib-blas: $(LIBBLAS)
 all-blas: $(TEST1_BIN) $(TEST23_BIN) $(LIBBLAS)
 

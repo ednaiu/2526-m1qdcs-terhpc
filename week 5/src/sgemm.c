@@ -394,17 +394,32 @@ static void sgemm_task2(int M, int N, int K,
                                          firstprivate(ic, jc, M_blk, N_blk, tile_idx)
                         {
                             float *pCp = partial_C[tile_idx * r + 0];
-                            __m256 vbeta = _mm256_set1_ps(beta);
+                            /* Beta fast-paths: avoid FMA when unnecessary.
+                             * Investigation result: for beta=0 (most GEMM calls) we
+                             * skip the C load entirely — saves one memory round-trip.
+                             * For beta=1 an add suffices. FMA only for general beta. */
                             for (int i = 0; i < M_blk; i++) {
                                 float *Crow = C + (ic + i) * ldc + jc;
                                 float *Prow = pCp + i * NC;
                                 int j = 0;
-                                for (; j <= N_blk - 8; j += 8) {
-                                    __m256 cv = _mm256_loadu_ps(Crow + j);
-                                    __m256 pv = _mm256_loadu_ps(Prow + j);
-                                    _mm256_storeu_ps(Crow + j, _mm256_fmadd_ps(vbeta, cv, pv));
+                                if (beta == 0.0f) {
+                                    for (; j <= N_blk - 8; j += 8)
+                                        _mm256_storeu_ps(Crow + j, _mm256_loadu_ps(Prow + j));
+                                    for (; j < N_blk; j++) Crow[j] = Prow[j];
+                                } else if (beta == 1.0f) {
+                                    for (; j <= N_blk - 8; j += 8)
+                                        _mm256_storeu_ps(Crow + j,
+                                            _mm256_add_ps(_mm256_loadu_ps(Crow + j),
+                                                          _mm256_loadu_ps(Prow + j)));
+                                    for (; j < N_blk; j++) Crow[j] += Prow[j];
+                                } else {
+                                    __m256 vb = _mm256_set1_ps(beta);
+                                    for (; j <= N_blk - 8; j += 8)
+                                        _mm256_storeu_ps(Crow + j,
+                                            _mm256_fmadd_ps(vb, _mm256_loadu_ps(Crow + j),
+                                                            _mm256_loadu_ps(Prow + j)));
+                                    for (; j < N_blk; j++) Crow[j] = beta * Crow[j] + Prow[j];
                                 }
-                                for (; j < N_blk; j++) Crow[j] = beta * Crow[j] + Prow[j];
                             }
                         }
                     } else {
@@ -455,17 +470,28 @@ static void sgemm_task2(int M, int N, int K,
                                              firstprivate(ic, jc, M_blk, N_blk, tile_idx, last_depptr)
                             {
                                 float *pCp = partial_C[tile_idx * r + last_depptr];
-                                __m256 vbeta = _mm256_set1_ps(beta);
                                 for (int i = 0; i < M_blk; i++) {
                                     float *Crow = C + (ic + i) * ldc + jc;
                                     float *Prow = pCp + i * NC;
                                     int j = 0;
-                                    for (; j <= N_blk - 8; j += 8) {
-                                        __m256 cv = _mm256_loadu_ps(Crow + j);
-                                        __m256 pv = _mm256_loadu_ps(Prow + j);
-                                        _mm256_storeu_ps(Crow + j, _mm256_fmadd_ps(vbeta, cv, pv));
+                                    if (beta == 0.0f) {
+                                        for (; j <= N_blk - 8; j += 8)
+                                            _mm256_storeu_ps(Crow + j, _mm256_loadu_ps(Prow + j));
+                                        for (; j < N_blk; j++) Crow[j] = Prow[j];
+                                    } else if (beta == 1.0f) {
+                                        for (; j <= N_blk - 8; j += 8)
+                                            _mm256_storeu_ps(Crow + j,
+                                                _mm256_add_ps(_mm256_loadu_ps(Crow + j),
+                                                              _mm256_loadu_ps(Prow + j)));
+                                        for (; j < N_blk; j++) Crow[j] += Prow[j];
+                                    } else {
+                                        __m256 vb = _mm256_set1_ps(beta);
+                                        for (; j <= N_blk - 8; j += 8)
+                                            _mm256_storeu_ps(Crow + j,
+                                                _mm256_fmadd_ps(vb, _mm256_loadu_ps(Crow + j),
+                                                                _mm256_loadu_ps(Prow + j)));
+                                        for (; j < N_blk; j++) Crow[j] = beta * Crow[j] + Prow[j];
                                     }
-                                    for (; j < N_blk; j++) Crow[j] = beta * Crow[j] + Prow[j];
                                 }
                             }
                         } else {
