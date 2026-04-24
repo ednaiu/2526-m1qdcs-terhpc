@@ -36,7 +36,7 @@ Week 3 successfully implemented targeted micro-kernel and macro-level optimizati
 
 **Expected benefit:** 2–8% throughput gain at medium/large sizes
 
-### 1.2 Software Prefetching (Next-Tile) (in L1 cache)
+### 1.2 Software Prefetching (Next-Tile)
 
 **Status:** ✅ Implemented
 
