@@ -1,0 +1,43 @@
+{
+  "problem": {
+    "M": 512,
+    "N": 512,
+    "K": 512
+  },
+  "kernel": "6x16",
+  "threads": 1,
+  "algorithms": {
+    "gradient_descent": {
+      "best_gflops": 66.8172,
+      "best_config": {
+        "MC": 120,
+        "KC": 256,
+        "NC": 4096
+      },
+      "total_evaluations": 34,
+      "wall_time_s": 2.74212646484375
+    },
+    "bayesian_optimization": {
+      "best_gflops": 66.9173,
+      "best_config": {
+        "MC": 480,
+        "KC": 256,
+        "NC": 10432
+      },
+      "total_evaluations": 25,
+      "wall_time_s": 3.9615161418914795
+    },
+    "simulated_annealing": {
+      "best_gflops": 66.2726,
+      "best_config": {
+        "MC": 90,
+        "KC": 256,
+        "NC": 3952
+      },
+      "total_evaluations": 24,
+      "wall_time_s": 2.1369271278381348
+    },
+    "random_search": {
+      "best_gflops": 64.9493,
+      "best_config": {
+        "MC": 
