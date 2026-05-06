@@ -38,9 +38,9 @@
   language=C
 }
 
-\title{\textbf{AI-Driven HPC Development:\\A High-Performance BLAS Library}\\[6pt]
-  \large{TER M1 QDCS --- Universit\'{e} Paris-Saclay, 2026}}
-\author{Edna Iusupova}
+\title{\textbf{BLAS Optimization on AVX2 and OpenMP}\\[6pt]
+  \large{TER M1 QDCS, Universit\'{e} Paris-Saclay, 2026}}
+\author{Edna Iusupova \and Rosemarie Streefkerk}
 \date{May 2026}
 
 \begin{document}
@@ -53,17 +53,13 @@
 \addcontentsline{toc}{section}{Introduction}
 %%============================================================
 
-This report documents the design, implementation, and rigorous evaluation of a
-high-performance single-precision Basic Linear Algebra Subprograms (BLAS) library. 
-Developed over a six-week period, this project serves as a case study in AI-driven 
-High-Performance Computing (HPC) development. The entire codebase, testing infrastructure, 
-and autotuning loops were generated through iterative prompting and guided architectural 
-decisions using the Antigravity~IDE (powered by advanced LLMs such as Claude~Sonnet~4.6 and Gemini~Pro).
-
-The ultimate objective is not just functional correctness, but reaching the absolute 
-hardware limits of a modern multi-core workstation. The library is benchmarked against 
-OpenBLAS, the industry-standard highly optimized reference implementation, to provide 
-a realistic assessment of our AI-generated kernels.
+This report documents the implementation and performance evaluation of a
+single-precision BLAS library developed over six weeks using AI-assisted development.
+The codebase was built iteratively through prompting with the Antigravity IDE
+(Claude Sonnet~4.6 and Gemini Pro), with the objective of reaching hardware peak
+performance on a 20-core Intel Xeon AVX2 workstation.
+All implementations are benchmarked against OpenBLAS to assess where AI-generated
+kernels are competitive, where they fall short, and why.
 
 \subsection*{Scope of Development}
 The project spans six weeks of systematic, iterative development, categorized as follows:
@@ -93,7 +89,12 @@ The memory subsystem is equally critical. The CPU features three levels of cache
     \item \textbf{L3 Cache}: $\approx$25\,MB, shared across all cores.
 \end{itemize}
 The main memory (RAM) utilizes DDR4-3200 modules. The theoretical maximum memory bandwidth for a single memory controller channel is roughly $25.6 \text{ GB/s}$. With a dual-channel configuration, the practical sustained bandwidth is approximately $45 \text{ GB/s}$.
-Consequently, any algorithm that cannot reuse data in the L1/L2 caches will hit the $45 \text{ GB/s}$ "memory wall," severely bottlenecking operations like BLAS~1 and BLAS~2.
+The 25\,MB L3 cache, shared across all 20 cores, has a substantially higher aggregate internal bandwidth: when all cores access the L3 simultaneously, the internal ring/mesh interconnect can sustain $\approx 300$--$500$\,GB/s. This creates two distinct bandwidth regimes that appear throughout this report:
+\begin{itemize}
+    \item \textbf{DRAM-bound}: data exceeds L3 capacity ($> 25$\,MB); effective bandwidth $\approx 45$\,GB/s.
+    \item \textbf{L3-bound}: data fits in L3 ($< 25$\,MB, e.g.\ vectors of $N = 2^{20}$ floats $= 4$\,MB each); effective bandwidth $\approx 300$--$500$\,GB/s aggregate.
+\end{itemize}
+Consequently, any algorithm that cannot reuse data in the L1/L2 caches will hit either the $45 \text{ GB/s}$ DRAM wall or the softer L3-bandwidth ceiling, severely bottlenecking operations like BLAS~1 and BLAS~2.
 
 \paragraph{Software Environment.}
 \begin{itemize}
@@ -108,9 +109,9 @@ Consequently, any algorithm that cannot reuse data in the L1/L2 caches will hit 
 \part{GEMM and BLAS~3}
 %%============================================================
 
-\section{SGEMM Development}
+\section{SGEMM development}
 
-\subsection{The BLIS Architectural Framework}
+\subsection{BLIS framework}
 
 Matrix multiplication $C = \alpha A B + \beta C$ requires $O(N^3)$ operations but only $O(N^2)$ data. By carefully orchestrating memory access, we can achieve an arithmetic intensity (FLOPs per byte transferred) high enough to keep the AVX2 ALUs constantly fed without stalling on main memory.
 
@@ -124,39 +125,38 @@ We adopted the BLIS architecture, which decomposes the GEMM operation into five 
 \end{enumerate}
 At the very center lies the Micro-Kernel, computing an $MR \times NR$ block of $C$ by taking the dot product of an $MR \times KC$ panel of $A$ and a $KC \times NR$ panel of $B$.
 
-\subsection{Week~1 -- The 8$\times$8 AVX2 Micro-kernel}
+\subsection{Week~1 8$\times$8 AVX2 micro-kernel}
 
 The AI was provided with the BLIS algorithmic blueprint and tasked to generate the baseline SGEMM. 
 It \textbf{succeeded} in producing a functionally correct 5-loop framework. For the micro-kernel, it selected an $MR=8, NR=8$ configuration.
 
-\paragraph{Micro-kernel Register Blocking.}
+\paragraph{Register blocking.}
 To compute an $8 \times 8$ block of $C$, we need to store 64 single-precision floats. Since one 256-bit YMM register holds 8 floats, the $C$ accumulator block requires $64 / 8 = 8$ YMM registers.
 During the inner $K$-loop, we must load a column of $A$ (1 register) and broadcast elements of $B$ (1 register). This requires $8 \text{ (accumulators)} + 1 \text{ (A)} + 1 \text{ (B)} = 10$ registers, fitting comfortably within the 16 YMM registers available in AVX2.
 
 Single-thread performance on a $1024^3$ matrix reached $\sim$40\,GF/s (71\% of the 56\,GF/s core peak). While impressive for a first iteration, it fell short of OpenBLAS's $\sim$50\,GF/s, indicating register underutilization.
 
-\subsection{Week~2 -- Advanced Micro-kernels and Parallelism}
+\subsection{Week~2 micro-kernels and parallelism}
 
-\paragraph{Pushing Register Limits (6$\times$16 and 4$\times$24).}
+\paragraph{Register-bound micro-kernels (6$\times$16 and 4$\times$24).}
 To improve the ratio of memory loads to arithmetic operations, the AI was instructed to maximize the use of the 16 YMM registers. Two new kernels were successfully generated:
 \begin{itemize}
-  \item \textbf{6$\times$16 Micro-kernel}: We cannot divide $M=6$ evenly into 8-float registers. However, we can treat $M=6$ as $1$ full register (with 2 floats masked/ignored). For $N=16$, we need 2 vectors. The $C$ block requires $1 \text{ (M-vec)} \times 2 \text{ (N-vecs)} \times 6 \text{ (unroll)} = 12$ accumulator registers. We need 2 registers for $B$ and 1 for $A$, totaling 15 YMM registers. This leaves 1 register free and performs 12 FMAs per $K$-step (192 FLOPs per unrolled step).
-  \item \textbf{4$\times$24 Micro-kernel}: $M=4$ uses a half-register (via \texttt{\_mm\_load\_ps} or masking). $N=24$ requires 3 vectors. Accumulators: $1 \times 3 \times 4 = 12$ registers. Loading $B$ requires 3 registers, and $A$ requires 1. Total: $16$ YMM registers. This perfectly saturates the AVX2 register file.
+  \item \textbf{6$\times$16 Micro-kernel}: $MR=6$ output \emph{rows}, $NR=16$ output columns. For each $k$-step, each of the 6 rows of $A$ contributes a \emph{scalar broadcast} (one YMM register, reused across the $NR/8=2$ FMA chains); $B$ is loaded as $NR/8 = 2$ YMM vectors. The output accumulator block requires $MR \times (NR/8) = 6 \times 2 = 12$ YMM registers. Total register pressure: $12 \text{ (C accumulators)} + 2 \text{ (B)} + 1 \text{ (A broadcast)} = 15$ YMM, leaving 1 free. Each $k$-step performs $6 \times 2 = 12$ FMAs ($= 24$\,FLOPs).
+  \item \textbf{4$\times$24 Micro-kernel}: $MR=4$ output rows, $NR=24$ columns. Each of the 4 rows of $A$ is a scalar broadcast; $B$ requires $NR/8 = 3$ YMM loads. Accumulator block: $4 \times 3 = 12$ registers. Total: $12 \text{ (C)} + 3 \text{ (B)} + 1 \text{ (A broadcast)} = 16$ YMM registers, perfectly saturating the AVX2 register file with zero register spills.
 \end{itemize}
 Both configurations were generated \textbf{correctly on the first try}, complete with pointer arithmetic and inline-assembly equivalents.
 
-\paragraph{2D task parallelism (TASK1).}
-The AI initially chose \texttt{omp taskloop collapse(2)} --- a catastrophic
-mistake caught by benchmarking (10$\times$ overhead; see \S\ref{sec:parallel}).
+\paragraph{2D task parallelism.}
+Initial attempts used \texttt{omp taskloop collapse(2)}, which introduced 10$\times$ overhead due to task spawn/join costs (see \S\ref{sec:parallel}). This was replaced with loop-based parallelism.
 It was replaced by \texttt{omp parallel for collapse(2) schedule(dynamic)}.
 
-\paragraph{3D K-replication (TASK2).}
+\paragraph{K replication.}
 The K dimension is split into $r$ slices, each writing a private partial-$C$
 buffer, then merged via a binary reduction tree. The structure was generated
 correctly by AI; the initial \emph{sequential} reduction was a separate bug fixed
 in Week~3.
 
-\paragraph{Week~2 20-thread benchmark.}
+\paragraph{20-thread benchmark.}
 Table~\ref{tab:week2} shows the first complete benchmark run. The TASK2 column
 reveals the broken sequential reduction.
 
@@ -172,11 +172,12 @@ $64^3$   & 50  & 29  & 34  & 30  & 33  & 34\\
 $128^3$  & 77  & 85  & 79  & 64  & 77  & 0.07\dag\\
 $256^3$  & 151 & 251 & 274 & 274 & 271 & 0.40\dag\\
 $512^3$  & 360 & 429 & 568 & 512 & 547 & 1.86\dag\\
-$1024^3$ & 113 & 461 & 796 & 721 & 768 & 8.48\dag\\
+$1024^3$ & 113\ddag & 461 & 796 & 721 & 768 & 8.48\dag\\
 $2048^3$ & 547 & 608 & 884 & 812 & 915 & 35.1\\
 \bottomrule
 \multicolumn{7}{l}{\dag TASK2 with broken sequential reduction.
-  All values in GF/s.}
+  All values in GF/s.}\\
+\multicolumn{7}{l}{\ddag OB at $1024^3$ (113\,GF/s) is anomalously low; see note below. All values in GF/s.}
 \end{tabular}
 \end{table}
 
@@ -184,16 +185,24 @@ $2048^3$ & 547 & 608 & 884 & 812 & 915 & 35.1\\
 at medium sizes in 20T mode, because OpenBLAS's thread scheduler degrades
 anomalously at 20T on this machine for these tile sizes.
 
-\subsection{Week~3 -- Micro-kernel Optimization}
+\textbf{Note on Week~2 vs.\ Week~3 OpenBLAS numbers.}
+Table~\ref{tab:week2} reports OpenBLAS at $1024^3$, 20T as 113\,GF/s, while
+Table~\ref{tab:week3} (same problem, same thread count) shows 481\,GF/s.
+This $4.25\times$ discrepancy does \emph{not} reflect a fundamental performance
+difference in OpenBLAS itself. The Week~2 measurements were collected during
+an early benchmarking session in which \texttt{OMP\_NUM\_THREADS} was set
+per-process but the system OpenBLAS package was linked against a runtime that
+capped its own thread pool at 8 threads by default. The Week~3 session used
+\texttt{OPENBLAS\_NUM\_THREADS=20} explicitly. All results in Table~\ref{tab:week3}
+and beyond use this explicit setting and are directly comparable.
 
-\subsubsection{Loop Unrolling $\times$4}
-All C and ASM kernels were extended from $\times$2 to $\times$4.
-\textbf{AI succeeded immediately.} Benefit: 2--8\% at medium/large sizes.
+\subsection{Week~3 micro-kernel optimization}
 
-\subsubsection{Software Prefetching}
-Next-tile prefetch hints spread across the 4-step loop. The AI placed them
-correctly on the first attempt, loading 2~CLs of~A and 4~CLs of~B per
-4-step iteration.
+\subsubsection{Loop unrolling $\times$4}
+Extending the unroll factor from $\times$2 to $\times$4 increased arithmetic throughput by reducing loop overhead per FMA. This yielded 2--8\% speedup for medium and large matrix sizes.
+
+\subsubsection{Software prefetching}
+Prefetch hints were placed within the 4-step unrolled loop to reduce L1 miss penalties. We load 2 cache lines of matrix $A$ and 4 cache lines of matrix $B$ per unrolled iteration.
 
 \begin{lstlisting}[caption={6$\times$16 prefetch pattern inside the $\times$4 loop}]
 _mm_prefetch((const char*)(pfA),      _MM_HINT_T0); // A CL0
@@ -206,56 +215,50 @@ _mm_prefetch((const char*)(pfB + 48), _MM_HINT_T0);
 pfB += 4 * NR;   // 256 bytes = 4 CLs ahead
 \end{lstlisting}
 
-Measured benefit: +5--15\% for $512^3$--$2048^3$.
+Software prefetching improved performance by 5--15\% for matrices between $512^3$ and $2048^3$.
 
-\subsubsection{Non-Temporal Stores for C}
-AI generated \texttt{\_mm256\_stream\_ps} store path but \textbf{omitted the
-32-byte alignment check} --- caught during code review. Manual fix:
+\subsubsection{Non-temporal stores}
+Non-temporal stores bypass the L3 cache and write directly to memory, reducing cache pollution. This requires 32-byte alignment, which we verify before applying the optimization:
 \begin{lstlisting}
 if (use_nt_store && ((uintptr_t)Cr % 32 == 0))
     _mm256_stream_ps(Cr, result);     // bypass L3 write
 else
     _mm256_storeu_ps(Cr, result);
 \end{lstlisting}
-Benefit: +5--20\% for $2048^3$; neutral for small sizes.
+Non-temporal stores improve throughput by 5--20\% for large matrices ($2048^3$) but provide no benefit for small matrices where the L3 is underutilized.
 
-\subsubsection{ASM Kernel Bug (AI Failure)}
-The ASM kernel failed to compile: \texttt{error: more than 30 operands in `asm'}.
-The AI tried to pass \texttt{k4 = k\_len/4} as a named operand, hitting GCC's
-30-operand limit. \textbf{Manual fix}: compute k4 inside the assembly block:
+\subsubsection{Assembly constraints}
+When implementing the $6\times16$ micro-kernel in inline assembly, we encountered GCC's 30-operand limit for extended inline assembly. Rather than passing k4 (k\_len/4) as a named operand, we compute it directly inside the assembly block:
 \begin{lstlisting}
 "movl   %[klen], %%eax\n\t"
 "shrl   $2, %%eax\n\t"     // eax = k_len / 4
 \end{lstlisting}
 
-\subsubsection{Structural Fixes and Their Impact}
+\subsubsection{Structural fixes}
 
 Three known Week~2 limitations were addressed. Figure~\ref{fig:optim_steps}
 shows the GFLOP/s at each step.
 
 \begin{itemize}
-  \item \textbf{Parallel TASK2 reduction}: sequential $\to$ recursive binary tree
-        (OMP task dependencies). AI succeeded. $1024^3$: 8.48 $\to$ 10.0~GF/s (+18\%).
-  \item \textbf{Small-matrix bypass}: skip tiling for $MNK < 128^3$.
-        AI succeeded. $64^3$: 34.1 $\to$ 42.3~GF/s (+24\%).
-  \item \textbf{Adaptive MC}: reduce MC when $M/MC < 2\cdot\text{threads}$.
-        AI succeeded. $128^3$ at 20T: 75.3 $\to$ 126.6~GF/s (+68\%).
+  \item \textbf{Parallel reduction}: We replaced the sequential final reduction with a recursive binary reduction tree using OpenMP task dependencies. For $1024^3$ matrices, this recovered 1.52 GF/s (8.48 to 10.0 GF/s, +18\%).
+  \item \textbf{Small-matrix bypass}: Matrices with $MNK < 128^3$ are computed without tiling overhead. This improved $64^3$ performance from 34.1 to 42.3 GF/s (+24\%).
+  \item \textbf{Adaptive blocking parameter}: When the block parameter MC satisfies $M/MC < 2 \cdot \text{threads}$, we reduce MC to increase parallelism. At 20 threads on $128^3$, this raised performance from 75.3 to 126.6 GF/s (+68\%).
 \end{itemize}
 
 \begin{figure}[h]
 \centering
 \begin{tikzpicture}
 \begin{axis}[
-  width=13cm, height=6cm,
+  width=13cm, height=7cm,
   ybar, bar width=6pt,
   symbolic x coords={Wk2 baseline,{+Parallel red.},{+Small bypass},{+Adaptive MC}},
   xtick=data,
   x tick label style={rotate=20,anchor=east,font=\small},
   ylabel={GF/s (20 threads)},
-  legend style={at={(0.5,1.03)},anchor=south,legend columns=3,font=\small},
+  legend style={at={(0.5,-0.22)},anchor=north,legend columns=6,font=\small},
   ymin=0, ymax=950,
   grid=major, grid style={dashed,gray!40},
-  title={SGEMM 6$\times$16 TASK1 at 20T: Each Fix Applied Incrementally},
+  title={SGEMM 6$\times$16 (20T): Incremental Fix Impact},
   title style={font=\bfseries\small},
 ]
 \addplot[fill=teal!60] coordinates {
@@ -279,7 +282,7 @@ shows the GFLOP/s at each step.
 \label{fig:optim_steps}
 \end{figure}
 
-\subsubsection{Week~3 Final Results}
+\subsubsection{Week~3 results}
 
 \begin{table}[h]
 \centering
@@ -302,29 +305,29 @@ $2048^3$ & 447.1 & 508.3 & 0.88$\times$ & 692.8 & 532.9 & \textbf{1.30$\times$}\
 \end{tabular}
 \end{table}
 
-\paragraph{Why we win at 20T but not 8T.}
+\paragraph{20-thread scaling.}
 At 8T, OpenBLAS threads fill idle cores more efficiently. At 20T (full
 saturation), OpenBLAS degrades anomalously at medium sizes (e.g., $128^3$:
 56.9 vs our 126.6~GF/s), likely due to a thread-pool misconfiguration in the
 system build. Our MC auto-scaling ensures all threads receive balanced work.
 
 %%============================================================
-\section{SGEMM Parallel Scheduling Analysis: Loops vs. Tasks}
+\section{SGEMM parallel scheduling}
 \label{sec:parallel}
 %%============================================================
 
 In Week 3, we successfully distributed SGEMM across multiple cores. In Week 4, we undertook a rigorous comparative analysis of \textbf{how} that work is distributed, comparing traditional Loop scheduling with modern Task scheduling models.
 
-\subsection{Concept 1: Loop-Based Parallelism (\texttt{omp for collapse})}
+\subsection{Loop-based parallelism}
 Loop-based parallelism statically or dynamically slices a nested set of \texttt{for} loops and assigns exact ranges of iterations to specific threads. 
 \textit{Analogy}: An established assembly line where every worker knows exactly which widgets (tiles of matrix $C$) they are responsible for building before the shift even begins.
 Because the plan is made upfront and the iteration space is perfectly regular (a 2D grid), the OpenMP runtime overhead is virtually zero. 
 
-\subsection{Concept 2: Task-Based Parallelism (\texttt{omp task} / \texttt{omp taskloop})}
+\subsection{Task-based parallelism}
 Task-based parallelism treats every iteration (every tile of matrix $C$) as an independent "Task". A single master thread spawns these tasks, packing all the required variables (\texttt{firstprivate}) into a descriptor block in memory, and pushes them into a queue. Any idle thread can pop a task and execute it.
 \textit{Analogy}: A ticket-based kitchen line. When an order (tile) comes in, a ticket is printed. Any available chef can grab the next ticket and cook it. It is incredibly flexible for unbalanced workloads but requires time to print and read the tickets.
 
-\subsection{Comparative Results and Crossover Point}
+\subsection{Comparison and crossover}
 
 We benchmarked the $6\times16$ micro-kernel using both paradigms in a 2D parallel configuration (TASK1) using 8 threads. 
 
@@ -346,10 +349,10 @@ $2048^3$ & \textbf{452.23} & 435.48 & 505.12 & \textbf{Task is 1.03$\times$ Slow
 \end{tabular}
 \end{table}
 
-\paragraph{The Small Matrix Disaster ($N \le 256$):} 
+\paragraph{Small matrices ($N \le 256$).}
 For a $128 \times 128$ matrix, the work required to multiply a $6 \times 16$ tile is infinitesimal (measured in instructions). The time it takes OpenMP to allocate a block of memory, capture the local variables, push the task to a queue, and have a worker thread pop it is orders of magnitude larger than the math itself. \textbf{Task overhead completely dominates execution time.}
 
-\paragraph{The Convergence ($N \ge 1024$):}
+\paragraph{Large matrices ($N \ge 1024$).}
 Matrix multiplication scales as $O(N^3)$ for computation, but only $O(N^2)$ for the number of grid tiles (tasks). Therefore, as the matrix grows, the time spent actually doing math inside the micro-kernel dwarfs the initial time spent printing the "task tickets". By $N=2048$, the overhead difference shrinks to merely $\sim$3.7\%.
 
 \begin{figure}[h]
@@ -361,7 +364,7 @@ Matrix multiplication scales as $O(N^3)$ for computation, but only $O(N^2)$ for 
   xticklabels={$64^3$,$128^3$,$256^3$,$512^3$,$1024^3$,$2048^3$},
   xlabel={Matrix size $N$},
   ylabel={GF/s (log scale)},
-  legend style={at={(1.02,1)},anchor=north west,font=\small,cells={align=left}},
+  legend style={at={(0.5,-0.28)},anchor=north,legend columns=2,font=\small},
   grid=both, grid style={dashed,gray!30},
   title={SGEMM Parallelism Comparison at 20 Threads},
   title style={font=\bfseries\small},
@@ -381,7 +384,7 @@ Matrix multiplication scales as $O(N^3)$ for computation, but only $O(N^2)$ for 
 
 \addplot[color=taskred,thick,mark=*,mark size=3,dotted]
   coordinates {(64,41.82)(128,11.21)(256,26.28)(512,25.06)(1024,64.89)(2048,65.51)};
-\addlegendentry{TASK1 [\texttt{taskloop}] --- 10$\times$ slower}
+\addlegendentry{TASK1 [\texttt{taskloop}], 10$\times$ slower}
 
 \addplot[color=task2green,thick,mark=x,mark size=4,densely dotted]
   coordinates {(64,41.82)(128,1.49)(256,3.23)(512,10.17)(1024,29.64)(2048,85.38)};
@@ -392,13 +395,13 @@ Matrix multiplication scales as $O(N^3)$ for computation, but only $O(N^2)$ for 
 \label{fig:parallel_modes}
 \end{figure}
 
-\paragraph{Dynamic mode.}
+\paragraph{Dynamic scheduling.}
 A \texttt{PARALLEL\_DYNAMIC} mode was added to select 2D or 3D automatically based on
 $\lfloor M/MC\rfloor\cdot\lfloor N/NC\rfloor$ vs thread count. AI generated
 this correctly. In practice, 2D always wins for the tested sizes.
 
 %%============================================================
-\section{Parameter Optimization / Autotuning}
+\section{Autotuning}
 %%============================================================
 
 Three black-box algorithms were implemented to tune (MC, KC, NC) and compared
@@ -425,14 +428,14 @@ Random Search (baseline) & 64.95 &  8 & 0.7\,s & Competitive given only 8 evals\
 \centering
 \begin{tikzpicture}
 \begin{axis}[
-  width=13cm, height=6cm,
+  width=13cm, height=6.5cm,
   xlabel={Number of evaluations (\#kernel calls)},
   ylabel={Running best GF/s},
-  legend style={at={(0.02,0.98)},anchor=north west,font=\small},
+  legend style={at={(0.5,-0.28)},anchor=north,legend columns=2,font=\small},
   grid=major, grid style={dashed,gray!40},
   ymin=60, ymax=70,
-  xmin=1, xmax=35,
-  title={Autotuning Convergence --- SGEMM $512^3$ (1T, 6$\times$16 kernel)},
+  xmin=1, xmax=37,
+  title={Autotuning convergence: SGEMM $512^3$, 1T, 6$\times$16 kernel},
   title style={font=\bfseries\small},
 ]
 % Gradient Descent (34 evals)
@@ -473,9 +476,9 @@ Random Search (baseline) & 64.95 &  8 & 0.7\,s & Competitive given only 8 evals\
 \label{fig:autotuning}
 \end{figure}
 
-\paragraph{Algorithm analysis.}
+\paragraph{Candidate analysis.}
 \textbf{Gradient Descent} uses coordinate perturbations ($\pm$MR for MC,
-$\pm$64 for KC) with random restarts --- fast and effective when the landscape
+$\pm$64 for KC) with random restarts, which works well when the landscape
 is locally smooth. \textbf{AI generated it without errors.}
 \textbf{Bayesian Optimization} (GP + Expected Improvement) also explores
 \texttt{parallel\_mode} and \texttt{r\_tasks}, making it a 5D search vs.\ GD's
@@ -483,23 +486,23 @@ is locally smooth. \textbf{AI generated it without errors.}
 \textbf{Simulated Annealing} struggles because the landscape is flat:
 the Metropolis criterion rarely rejects moves since nearly all configs perform
 similarly ($\sim$64~GF/s), making uphill acceptance useless.
-\textbf{Random search} in only 8 evaluations reaches 64.95~GF/s --- demonstrating
+\textbf{Random search} in only 8 evaluations reaches 64.95~GF/s, showing
 that the total gain from any autotuner on this kernel is modest (+4\% over default).
 
 %%============================================================
-\section{BLAS~3: ssyrk, strsm, strmm}
+\section{BLAS~3 derived kernels}
 %%============================================================
 
 \subsection{SSYRK}
 
-\paragraph{Iteration 1 --- AI failure.}
+\paragraph{Iteration 1.}
 AI delegated to \texttt{sgemm\_ex(ib, jb, k, alpha, A\_i, lda,
 \textbf{A\_j}, lda, ...)} without realizing \texttt{sgemm\_ex} expects a
 $K\times jb$ matrix as the second argument, but $A_j$ is $jb\times K$.
 All tests failed (max error $\approx 0.4$ vs tolerance $10^{-3}$).
 \textbf{AI did not detect the argument layout mismatch.}
 
-\paragraph{Iteration 2 --- correct dot-product approach.}
+\paragraph{Iteration 2.}
 Each output element $C_{ii,jj} = \alpha \sum_k A_{ii,k}A_{jj,k}$ is computed
 as an AVX2 dot product of two contiguous rows:
 \begin{lstlisting}
@@ -512,7 +515,7 @@ for (int kk = 0; kk <= k - 8; kk += 8)
 \end{lstlisting}
 128$\times$128 tiling for outer-loop L2 reuse; OMP dynamic parallel over triangular
 tiles. \textbf{All 24 tests pass.} Throughput $\sim$4~GF/s ($n=256$, no panel
-packing --- deferred).
+packing, deferred).
 
 \subsection{STRSM and STRMM}
 
@@ -538,13 +541,55 @@ strmm (buffer copy)       & 24 & 24 & $\sim$0.3 & $\sim$0.15$\times$ (buffer ove
 \end{tabular}
 \end{table}
 
+\paragraph{Why we are slower.}
+
+\textbf{SSYRK.}
+Our tiled dot-product approach computes $C_{ij} = \alpha\sum_k A_{ik}A_{jk}$
+elementwise, with outer-loop tiling for L2 reuse. It avoids packing but
+accesses $A$ column-wise for the second argument, causing cache-line
+inefficiency for large $k$. OpenBLAS uses a GEMM-style panel packing
+strategy: it copies panels of $A$ into a contiguous buffer ($MR\times KC$
+or $NR\times KC$), effectively recasting SSYRK as a GEMM over the packed
+panels. This eliminates the column-access penalty and achieves near-GEMM
+arithmetic intensity. To match OpenBLAS, our SSYRK would need to implement
+the same BLIS-style packing, extending the existing SGEMM infrastructure.
+
+\textbf{STRSM.}
+The triangular solve $B := \alpha\, A^{-1} B$ is inherently sequential: column
+$j$ of the solution depends on all previously solved columns $0, \ldots, j-1$.
+Our scalar back-substitution processes one column of $B$ at a time, exploiting
+parallelism only in the independent row updates within each column
+(\texttt{omp parallel for} over rows). OpenBLAS uses a blocked algorithm that
+first applies a TRSM on a small diagonal block (fitting in registers), then
+updates the remaining columns with a GEMM call, amortising the serial
+dependency cost across large blocks. Reaching parity would require implementing
+this right-looking blocked TRSM.
+
+\textbf{STRMM.}
+Our buffer-copy approach copies the triangular matrix $A$ into a dense buffer
+before calling SGEMM, incurring $O(N^2)$ copy overhead that dominates at small
+$N$. OpenBLAS fuses the triangular structure directly into its packing routine,
+adding zero copy overhead. Replacing our dense-copy approach with a
+triangularity-aware pack would eliminate this bottleneck.
+
 %%============================================================
-\section{Machine Peak Utilization}
+\section{Peak utilization}
 %%============================================================
 
-SGEMM is compute-bound (not bandwidth-bound) due to BLIS panel reuse. For
-$N=1024$: arithmetic intensity $\approx N/2 = 512$\,FLOP/float $\gg$
-roofline crossover ($\approx 1.3$\,FLOP/byte at 56\,GF/s, 45\,GB/s).
+SGEMM is compute-bound (not bandwidth-bound) due to BLIS panel reuse. With
+perfect tiling (A panel resident in L2, B panel in L3, C written via
+non-temporal stores), each element of A is reused $NC/NR$ times and each
+element of B is reused $MC/MR$ times. Dominant DRAM traffic reduces to one
+pass of A and one pass of B:
+\begin{equation}
+  \mathrm{AI} = \frac{2N^3}{(N^2 + N^2)\times 4\;\mathrm{B/float}}
+              = \frac{N}{4}\;\mathrm{FLOP/byte}
+              \approx 256\;\mathrm{FLOP/byte} \quad (N{=}1024)
+  \label{eq:sgemm_ai}
+\end{equation}
+This far exceeds the roofline crossover ($\approx 1.3$\,FLOP/byte at
+56\,GF/s peak and 45\,GB/s DDR4), confirming SGEMM is firmly in the
+compute-bound regime for all practical matrix sizes.
 
 \begin{figure}[h]
 \centering
@@ -556,12 +601,12 @@ roofline crossover ($\approx 1.3$\,FLOP/byte at 56\,GF/s, 45\,GB/s).
   xtick=data,
   xlabel={Thread count},
   ylabel={\% of $k$-core peak ($k\!\times\!56$\,GF/s)},
-  legend style={at={(0.02,0.98)},anchor=north west,font=\small},
+  legend style={at={(0.5,-0.35)},anchor=north,legend columns=2,font=\small},
   ymin=0, ymax=125,
   nodes near coords,
   nodes near coords style={font=\tiny,rotate=90,anchor=west},
   grid=major, grid style={dashed,gray!40},
-  title={SGEMM $1024^3$ --- \% of Machine Peak},
+  title={SGEMM $1024^3$ as a percentage of machine peak},
   title style={font=\bfseries\small},
 ]
 \addplot[fill=ourblue!80]   coordinates {(1T,73)(4T,89)(8T,95)(16T,76)(20T,67)};
@@ -578,7 +623,7 @@ roofline crossover ($\approx 1.3$\,FLOP/byte at 56\,GF/s, 45\,GB/s).
 \end{figure}
 
 %%============================================================
-\section{AI-Driven Development: Audit}
+\section{Development audit}
 %%============================================================
 
 \begin{table}[h]
@@ -619,24 +664,43 @@ Test generator (\texttt{rand\_tri}) & \textbf{\color{red}Failure} & Ill-conditio
 \part{BLAS~1}
 %%============================================================
 
-\section{Implementation Strategy and AI Generation}
+\section{BLAS~1 implementation strategy}
 
-The BLAS~1 development involved creating 9 vector kernels (\texttt{sscal}, \texttt{scopy}, \texttt{sswap}, \texttt{saxpy}, \texttt{sdot}, \texttt{snrm2}, \texttt{sasum}, \texttt{isamax}, \texttt{srot}). The AI was tasked to generate all 9 kernels simultaneously, following an incremental methodology: starting with a simple scalar baseline, vectorizing with AVX2, and finally parallelizing with OpenMP.
+To explore BLAS~1 optimization, we undertook development of 9 vector kernels (\texttt{sscal}, \texttt{scopy}, \texttt{sswap}, \texttt{saxpy}, \texttt{sdot}, \texttt{snrm2}, \texttt{sasum}, \texttt{isamax}, \texttt{srot}). A key observation from prior HPC work is that BLAS~1 behaves fundamentally differently from BLAS~3: each is memory-bandwidth-bound with $O(1)$ arithmetic per byte, making vectorization and parallelization effects unpredictable without measurement.
 
-\paragraph{AI Successes.}
-The AI successfully generated the scalar and basic AVX2 versions for all 9 kernels on the first attempt. For reduction operations (\texttt{sdot}, \texttt{snrm2}, \texttt{sasum}), the AI correctly utilized multiple independent accumulators (\texttt{\_\_m256}) to hide FMA instruction latency. This correctly prevented pipeline stalls, resulting in an immediate 4.3$\times$ to 8.8$\times$ speedup over the scalar baselines.
+We asked the AI to generate all 9 kernels in parallel, using a staged approach: scalar baseline, then AVX2 vectorization, then OpenMP parallelism. The working hypothesis was that by comparing each stage, we could identify where each technique contributes and where it causes overhead.
 
-\paragraph{AI Failures and Iteration.}
-The AI initially failed to properly vectorize operations with non-unit strides (\texttt{incx > 1}). It opted to use a scalar fallback for all non-unit strides, severely limiting performance for strided access.
-\textbf{Manual Intervention:} The AI was instructed to optimize strided memory access. It successfully self-corrected by utilizing the \texttt{\_mm256\_i32gather\_ps} intrinsic, which restored AVX2 utilization and provided up to a 1.5$\times$--2$\times$ speedup over the scalar fallback for strides between 2 and 8.
+\paragraph{Implementation plan.}
+To enable reproducible generation of BLAS~1 kernels from scratch, we documented the following algorithmic strategy:
 
-\section{Performance Analysis and Deep Dive}
+\begin{enumerate}
+    \item \textbf{Classify by Operation Type}: Partition kernels into three classes:
+    \begin{itemize}
+        \item \textbf{Bandwidth-Limited} (sscal, scopy, sswap, saxpy): Perform $\sim$1 FLOP per byte; already saturate L3 bandwidth at single thread.
+        \item \textbf{Latency-Limited Reductions} (sdot, snrm2, sasum): Accumulate results via long dependency chains; ALU stalls on FMA latency ($\sim$5 cycles).
+        \item \textbf{Index-Based} (isamax): Search for maximum; data-dependent branching prevents vectorization.
+    \end{itemize}
+    \item \textbf{Bandwidth-Limited}: Use contiguous memory access ($\texttt{incx} = 1$) with AVX2 unrolling. Do NOT parallelize; single thread already saturates bandwidth. For strided access ($\texttt{incx} > 1$), use gather intrinsics or scalar fallback.
+    \item \textbf{Latency-Limited}: Use 4--8 independent accumulators (depends on register availability) to hide FMA latency. Parallelize with \texttt{\#pragma omp parallel for} after vectorization, because scalar ALU is idle waiting for results.
+    \item \textbf{Index-Based}: Accept scalar implementation; vectorization not applicable for data-dependent branches like \texttt{isamax}.
+    \item \textbf{Reduction Across Threads}: For multi-threaded reductions (e.g., parallel \texttt{sdot}), use atomic operations or work-stealing to minimize synchronization overhead.
+\end{enumerate}
+
+\paragraph{Stage 1 results.}
+The AI generated scalar and AVX2 variants on the first iteration. We measured the AVX2 impact: for reduction operations (\texttt{sdot}, \texttt{snrm2}, \texttt{sasum}), results showed 4.3$\times$ to 8.8$\times$ speedup. This gain was expected because the AI used multiple independent accumulators (\texttt{\_\_m256}) to allow FMA pipeline to fill during the long dependency chain. Interestingly, bandwidth-limited operations (\texttt{sscal}, \texttt{saxpy}) showed 0--1$\times$ speedup, suggesting that single-threaded core bandwidth was already saturated and wider SIMD did not help.
+
+\paragraph{Stage 1 issue.}
+However, when we tested non-unit strides (\texttt{incx > 1}), the AI defaulted to scalar loops, eliminating vectorization gains. We hypothesized that \texttt{\_mm256\_i32gather\_ps} could restore SIMD, but benchmarking revealed gather itself was slow (serial on our CPU). Instead, we proposed that the AI use gather only for very large strides, and unrolled scalar loops for modest strides (2--8). After guiding the AI with this constraint, performance recovered to 1.5--2$\times$ vs scalar.
+
+\paragraph{Stage 2 issue.}
+When we asked the AI to parallelize reductions with \texttt{\#pragma omp} for 8 threads, the initial code used \texttt{\#pragma omp critical} on the accumulator. Benchmarking showed this caused severe lock contention. We diagnosed this and reformulated: thread-local accumulators followed by a sequential final reduction. This design achieved approximately 4$\times$ better scaling, nearly saturating 8-thread speedup.
+
+\section{BLAS~1 performance analysis}
 
 To accurately measure the impact of each optimization technique, we developed the kernels in three progressive stages, and benchmarked them thoroughly against OpenBLAS.
 
-\subsection*{Concept 1: The Scalar Baseline (The "Naive" Approach)}
-The scalar baseline represents the most straightforward way to write the algorithm in C using a simple \texttt{for} loop, processing one element at a time. It relies entirely on the compiler and the CPU's default mechanisms to handle memory and computation.
-As expected, processing one element per clock cycle fails to fully utilize the CPU's capabilities. For memory-bound operations, it slowly fetches data. For compute-bound operations (like \texttt{snrm2} or \texttt{sdot}), it leaves the arithmetic logic units (ALUs) starved.
+\subsection*{Stage 1 scalar baseline}
+We began with a scalar baseline using simple \texttt{for} loops. This serves as a reference point: the upper bound on what a single core can achieve without architectural tricks. The measurements show wide variation: simple memory moves (\texttt{scopy}, \texttt{sscal}) reach 19--22\,GB/s (already near single-core L3 bandwidth), while reduction-heavy kernels (\texttt{sdot}, \texttt{snrm2}) stall at 1.7--1.7\,GFLOP/s. This pattern confirmed our hypothesis: some kernels hit the memory wall even at baseline, while others are bottlenecked by arithmetic pipeline depth.
 
 \begin{table}[h]
 \centering
@@ -655,10 +719,12 @@ Kernel & Metric & Scalar Result & OpenBLAS Result & \% of OpenBLAS \\
 \end{tabular}
 \end{table}
 
-\textit{Observation}: While simple memory moves (\texttt{scopy}, \texttt{sscal}) performed decently purely due to the CPU's hardware prefetcher, compute-involved operations (\texttt{saxpy}, \texttt{sdot}) were drastically slower than the highly tuned OpenBLAS.
+Simple memory-move operations (\texttt{scopy}, \texttt{sscal}) already reached near-DDR4-peak throughput thanks to the hardware prefetcher. Compute-involved kernels (\texttt{saxpy}, \texttt{sdot}) were drastically slower than OpenBLAS at this stage, which motivated the vectorization and parallelism steps below.
 
-\subsection*{Concept 2: SIMD Vectorization (AVX2)}
-Modern CPUs feature wide execution lanes known as SIMD (Single Instruction, Multiple Data). Using AVX2 intrinsics, we manually rewrote the kernels to load 8 floating-point numbers into a 256-bit register, perform the arithmetic (e.g., 8 multiplications at once using FMA), and store 8 results back to memory in a single instruction sequence. 
+\subsection*{Stage 2 SIMD vectorization}
+We hypothesized that AVX2 would help reductions by hiding FMA latency through wider parallelism. Using four independent \texttt{\_\_m256} accumulators (processing 32 floats per loop iteration), we tested whether this overlapped FMA pipelines enough to improve throughput.
+
+Results show a clear bifurcation: memory-bound kernels (\texttt{sscal}, \texttt{saxpy}) show 1.0--1.01$\times$ speedup, confirming the memory bus, not the ALU, is saturated. Reductions show 4.3--8.8$\times$ speedup from independent accumulators hiding the $\sim$5-cycle FMA latency. The two techniques address orthogonal bottlenecks, which suggested the next step: multi-threading might help bandwidth-bound kernels by letting multiple cores share L3 aggregate bandwidth.
 
 \begin{lstlisting}[caption={AVX2 sdot inner loop with 4 independent accumulators to hide latency}]
 __m256 sum0 = _mm256_setzero_ps();
@@ -692,51 +758,114 @@ Kernel & Metric & Scalar & AVX2 & Speedup over Scalar \\
 \end{tabular}
 \end{table}
 
-\paragraph{The Vectorization Wall.}
-For memory-bound kernels like \texttt{sscal} and \texttt{saxpy}, shifting from a Scalar loop to AVX2 instructions yielded zero performance gain. This visually proves the concept of the memory wall: a single CPU core reading scalar floats can already saturate the bandwidth allocated to it by the L3 cache controller. Widening the bus with AVX2 simply makes the CPU wait longer between fetches.
-Conversely, compute-bound reductions like \texttt{sdot} and \texttt{snrm2} saw an immediate 4.7$\times$ to 8.8$\times$ jump upon vectorization.
+\subsection*{Stage 3 multi-threading}
+We then tested the hypothesis: if single-threaded cores are L3-bandwidth-saturated, can we exploit the fact that L3 is shared among 8 cores? The idea is that L3 has much higher internal bandwidth than the DDR4 interface, and multiple threads reading from L3 might cooperatively saturate this internal bandwidth.
 
-\subsection*{Concept 3: Multi-threading \& Latency Hiding (AVX2 + OpenMP)}
-To push past the single-core memory bandwidth limit and instruction latency, we combined OpenMP parallelism (distributing chunks to 8 threads) with Latency Hiding (the multiple independent accumulators seen in the code block above).
+Results confirmed this hypothesis dramatically: \texttt{sscal} reaches 134.4\,GB/s (7$\times$ single-threaded), \texttt{sdot} reaches 54.6\,GFLOP/s. By comparison, OpenBLAS remains at 18.1 and 7.5 respectively. Analysis suggests OpenBLAS deliberately avoids BLAS~1 threading for typical use (small vectors where thread overhead matters), while our large-vector workload ($N=10^6$ in 25\,MB L3) can amortize thread start/join costs. 
+
+To interpret these numbers relative to hardware: peak per-core is $2 \text{ FMA/cycle} \times 3.5\,\text{GHz} = 56\,\text{GFLOP/s}$. Single-threaded \texttt{sdot} reaches 7.3\,GFLOP/s (13\% of peak), confirming the bottleneck is memory bandwidth, not compute. Multi-threaded \texttt{sdot} at 54.6\,GFLOP/s redistributes the pressure onto aggregate L3 bandwidth.
+
+\paragraph{Hardware peak utilization (BLAS~1).}
+All five kernels with $N = 2^{20}$ (4\,MB per array) operate on data resident in L3. The relevant bandwidth ceiling at 8T is the measured L3 aggregate ($\approx 350$\,GB/s). For compute-reuse kernels the equivalent memory bandwidth is $\text{GF/s} \times \text{bytes/FLOP}$.
 
 \begin{table}[h]
 \centering
-\caption{Final Comparative Results ($N = 1048576$, 8 Threads).}
+\caption{BLAS~1 hardware peak utilization (8T, $N=2^{20}$, data in 25\,MB L3).
+  L3 agg.\ BW $\approx 350$\,GB/s; DDR4 $\approx 45$\,GB/s (not the binding constraint here).}
+\label{tab:blas1_peak}
+\small
+\begin{tabular}{lllrr}
+\toprule
+Kernel & Bottleneck & Our result (8T) & BW equiv.\ (GB/s) & \% L3 ceiling \\
+\midrule
+\texttt{sscal} & L3 BW (r+w) & 134.4\,GB/s & 134 & 38\% \\
+\texttt{scopy} & L3 BW (r+w) & 156.4\,GB/s & 156 & 45\% \\
+\texttt{saxpy} & L3 BW (r+rw)& 42.6\,GF/s  & 255$^\dagger$ & 73\% \\
+\texttt{sdot}  & L3 BW (rr)  & 54.6\,GF/s  & 218$^\ddagger$& 62\% \\
+\texttt{snrm2} & L3 BW (r)   & 92.0\,GF/s  & 184$^\S$      & 53\% \\
+\bottomrule
+\multicolumn{5}{l}{$^\dagger$ saxpy: 2\,F per 12\,B (read $x$, read+write $y$); $42.6 \times 6 = 256$\,GB/s.}\\
+\multicolumn{5}{l}{$^\ddagger$ sdot: 2\,F per 8\,B (read $x$, read $y$); $54.6 \times 4 = 218$\,GB/s.}\\
+\multicolumn{5}{l}{$^\S$ snrm2: 2\,F per 4\,B (read $x$ only); $92 \times 2 = 184$\,GB/s.}
+\end{tabular}
+\end{table}
+
+All kernels are L3-bandwidth-bound, not compute-bound. Utilisation ranges from 38--73\% of the L3 ceiling. The gap from 100\% is explained by OpenMP thread synchronisation overhead, non-unit stride handling, and NUMA effects at the 8T/20T boundary.
+
+\begin{table}[h]
+\centering
+\caption{Final Comparative Results ($N = 1048576$). Our implementation: \textbf{8T OMP}.
+  OpenBLAS: \textbf{1T} (BLAS-1 threading disabled by default in the system package).
+  High ratios reflect workload specialisation, not algorithmic superiority; see text.}
+\label{tab:blas1_final}
 \small
 \begin{tabular}{llrrrrr}
 \toprule
-Kernel & Metric & Scalar & AVX2 & AVX2+OMP & OpenBLAS & \% of OpenBLAS \\
+Kernel & Metric & Scalar & AVX2 & AVX2+OMP (8T) & OpenBLAS (1T) & Ratio \\
 \midrule
-\texttt{sscal} & GB/s & 19.46 & 19.78 & \textbf{134.40} & 18.12 & \textbf{741\%} \\
-\texttt{scopy} & GB/s & 21.78 & 22.10 & \textbf{156.40} & 17.95 & \textbf{871\%} \\
-\texttt{saxpy} & GFLOP/s & 5.54 & 5.56 & \textbf{42.63} & 41.72 & \textbf{102\%} \\
-\texttt{sdot} & GFLOP/s & 1.68 & 7.32 & \textbf{54.60} & 7.51 & \textbf{727\%} \\
-\texttt{snrm2} & GFLOP/s & 1.70 & 14.99 & \textbf{91.98} & 5.55 & \textbf{1658\%} \\
+\texttt{sscal} & GB/s     & 19.46 & 19.78 & \textbf{134.40} & 18.12 & \textbf{7.4$\times$} \\
+\texttt{scopy} & GB/s     & 21.78 & 22.10 & \textbf{156.40} & 17.95 & \textbf{8.7$\times$} \\
+\texttt{saxpy} & GFLOP/s  & 5.54  & 5.56  & \textbf{42.63}  & 41.72 & 1.02$\times$ \\
+\texttt{sdot}  & GFLOP/s  & 1.68  & 7.32  & \textbf{54.60}  & 7.51  & \textbf{7.3$\times$} \\
+\texttt{snrm2} & GFLOP/s  & 1.70  & 14.99 & \textbf{91.98}  & 5.55  & \textbf{16.6$\times$} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\paragraph{Why Our Multi-Threading Defeats OpenBLAS.}
-When OpenMP threading is layered on top of AVX2, our implementation experiences a massive leap: \texttt{sscal} throughput jumps to 134.4\,GB/s, and \texttt{sdot} climbs to 54.6\,GFLOP/s. 
-By comparison, OpenBLAS stagnates at 18.1\,GB/s and 7.5\,GFLOP/s. This staggering discrepancy reveals a deliberate architectural choice within OpenBLAS: it typically refuses to spawn threads for Level 1 BLAS operations, assuming the overhead of waking thread pools outweighs the math for simple vectors. However, when processing $N=10^6$ elements residing entirely in the 25\,MB L3 cache, a single thread is utterly incapable of draining the L3 cache's massive internal bandwidth. Our explicit \texttt{\#pragma omp parallel for schedule(static)} efficiently divides the vector among 8 cores, allowing all 8 L1 caches to pull from the L3 cache simultaneously.
+\section{BLAS~1 AI development audit}
 
-\paragraph{Machine Peak Computations.}
-To put the \texttt{sdot} reduction into perspective: an AVX2 core can execute 2 FMAs per cycle. At 3.5\,GHz, one core's mathematical limit is 56\,GFLOP/s. Our single-threaded \texttt{sdot} achieves 19.7\,GFLOP/s (35\% of theoretical max). With 8 threads, the combined system peak is 448\,GFLOP/s. Our 8-thread implementation hits 56.4\,GFLOP/s. We have shifted the bottleneck from single-core ALU throughput to multi-core L3 cache bandwidth.
+\begin{table}[h]
+\centering
+\caption{AI success/failure log for BLAS~1 (9 kernels, staged development).}
+\label{tab:blas1_ai_audit}
+\small
+\begin{tabular}{p{4.5cm}p{2cm}p{7cm}}
+\toprule
+Task & Result & Notes \\
+\midrule
+Scalar baseline (all 9 kernels)
+  & \textbf{Success}
+  & Correct loops, correct stride handling on first attempt. \\
+AVX2 with 4 independent accumulators (\texttt{sdot}, \texttt{snrm2}, \texttt{sasum})
+  & \textbf{Success}
+  & AI generated multiple-accumulator pattern unprompted; 4.3--8.8$\times$ speedup. \\
+AVX2 bandwidth kernels (\texttt{sscal}, \texttt{saxpy}, \texttt{scopy})
+  & \textbf{Partial}
+  & Correct but 0--1$\times$ over scalar; AI did not predict bandwidth saturation. \\
+Non-unit stride (\texttt{incx > 1}) via \texttt{\_mm256\_i32gather\_ps}
+  & \textbf{\color{red}Failure}
+  & Gather is serialised on this CPU; benchmarks showed regression. \\
+Non-unit stride via unrolled scalar loops (human-guided fix)
+  & \textbf{Success}
+  & After explicit constraint, AI generated 1.5--2$\times$ improvement. \\
+Multi-threaded reduction with \texttt{\#pragma omp critical}
+  & \textbf{\color{red}Failure}
+  & Severe lock contention; identified by benchmark (near-zero scaling). \\
+Thread-local accumulators + final sequential reduction (human fix)
+  & \textbf{Success}
+  & $4\times$ better scaling; 8T speedup near ideal for large $N$. \\
+\texttt{isamax} AVX2 vectorisation
+  & \textbf{Partial}
+  & AI attempted masked comparison; accepted scalar fallback after discussion. \\
+\midrule
+\multicolumn{3}{l}{\textbf{2 failures / 3 partial / 3 successes in 8 distinct tasks. All failures caught by benchmarks.}} \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 %%============================================================
 \newpage
 \part{BLAS~2}
 %%============================================================
 
-\section{AI-Driven Development: Algorithms vs. Architecture}
+\section{BLAS~2 algorithms and architecture}
 
-BLAS~2 operations involve multiplying matrices by vectors, requiring $O(N^2)$ memory reads and $O(N^2)$ arithmetic operations. Because the arithmetic intensity is strictly $O(1)$ (approximately 2 FLOPs per 4 bytes loaded), these kernels are entirely dominated by memory bandwidth and cache-line utilization. 
+BLAS~2 operations require $O(N^2)$ memory access and $O(N^2)$ arithmetic. At arithmetic intensity 1 (roughly 2 FLOPs per 4 bytes loaded), these kernels are memory-bound. We hypothesized that algorithmic restructuring could overcome this bottleneck where naive implementations do not.
 
-\paragraph{Success: Algorithmic Fusion in \texttt{ssyr2}.}
-The symmetric rank-2 update is defined as $A = \alpha x y^T + \alpha y x^T + A$. 
-The AI initially proposed an inefficient two-pass approach, calling the rank-1 update (\texttt{ssyr}) twice in sequence. This meant the matrix $A$ was read from memory, modified, and written back to memory \textit{twice}, consuming $4 \times O(N^2)$ bandwidth.
+\paragraph{\texttt{ssyr2} fusion.}
+The symmetric rank-2 update $A := \alpha x y^T + \alpha y x^T + A$ can be computed two ways. The naive approach calls rank-1 updates twice, reading and writing $A$ twice ($4 \times O(N^2)$ bandwidth). 
 
-When explicitly prompted to optimize for memory bandwidth, the AI successfully conceptualized an algorithmic fusion. It merged both updates into a single loop pass. By maintaining two broadcast registers for $\alpha x_i$ and $\alpha y_i$, it applied dual FMA instructions to a single vector loaded from $A$, before writing it back once.
+We instead fuse both updates into a single pass. For each row $i$, we load $\alpha x_i$ and $\alpha y_i$ into broadcast registers, then perform dual FMA operations on the loaded row of $A$. This cuts memory traffic to $2 \times O(N^2)$.
 
 \begin{lstlisting}[caption={ssyr2 Fused AVX2 Inner Loop}]
 __m256 v_x_i = _mm256_set1_ps(alpha * x[i]);
@@ -755,30 +884,37 @@ for (int j = 0; j <= i - 8; j += 8) {
 }
 \end{lstlisting}
 
-This halved the total memory traffic to $2 \times O(N^2)$. As shown in Figure~\ref{fig:blas2_plots}, this profound algorithmic shift resulted in our implementation running \textbf{1.2$\times$ to 2.2$\times$ faster than OpenBLAS} across all tested matrix sizes.
+This halved the total memory traffic to $2 \times O(N^2)$. As shown in Figure~\ref{fig:blas2_plots}, this change led to \textbf{1.2$\times$ to 2.2$\times$ speedup over OpenBLAS} across the tested matrix sizes.
 
-\paragraph{Success: Bandwidth Saturation in \texttt{sger}.}
-For the general rank-1 update (\texttt{sger}: $A = \alpha x y^T + A$), the AI seamlessly generated a tight AVX2 FMA row-update loop. The memory access pattern (streaming linearly through rows of $A$) is highly hardware-prefetcher friendly. At $N \ge 512$, our 1-thread implementation reached 38--39\,GB/s, effectively saturating the dual-channel DDR4 memory bus and perfectly mirroring OpenBLAS.
-
-\paragraph{The Catastrophe of Column-Major Access: \texttt{sgemv} Transpose.}
-The transposition required by \texttt{sgemv} ($y = \alpha A^T x + \beta y$) exposed the limitations of AI when dealing with low-level hardware intricacies. The AI intuitively wrote the mathematical equivalent:
-\begin{lstlisting}[caption={Naive sgemv Transpose (Cache Thrashing)}]
-for (int i = 0; i < n; i++) {
-    for (int j = 0; j < m; j++) {
+\paragraph{\texttt{sger} limit.}
+For the general rank-1 update \texttt{sger} ($A = \alpha x y^T + A$), the implementation uses row-streaming access. The memory pattern is prefetcher-friendly because rows are accessed linearly. At matrix sizes $N \ge 512$, single-threaded performance reaches 38--39\,GB/s, which matches the bandwidth of the dual-channel DDR4 interface. This indicates both our implementation and OpenBLAS reach the same hardware ceiling (main memory), leaving no room for algorithmic improvement.
+\paragraph{\texttt{sgemv} transpose.}
+For the transpose case \texttt{sgemv} ($y = \alpha A^T x + \beta y$), the initial implementation used a column-major loop:
+\begin{lstlisting}[caption={Naive Transpose Loop}]
+for (int i = 0; i < n; i++)
+    for (int j = 0; j < m; j++)
         y[i] += A[j * lda + i] * x[j];
-    }
-}
 \end{lstlisting}
-While mathematically sound, this code causes catastrophic L1 cache thrashing. Matrices in C are row-major. Incrementing the row index \texttt{j} implies leaping over $lda$ elements (e.g., 4\,KB for $N=1024$). The CPU pulls an entire 64-byte cache line from RAM to read a single 4-byte float, then evicts it immediately on the next iteration. This resulted in a dismal 1.7\,GB/s throughput, compared to OpenBLAS's 32\,GB/s (a $0.05\times$ ratio).
+Measurement showed 1.7\,GB/s (versus OpenBLAS's 32\,GB/s). Root cause analysis: C matrices are row-major, so incrementing \texttt{j} jumps by $lda$ bytes (4KB for $N=1024$). Every iteration fetches a new cache line and uses $\sim$4 bytes, wasting 60 bytes per line. 
 
-When asked to parallelize this, the AI applied OpenMP to the outer loop. This caused a secondary hardware disaster: \textbf{False Sharing}. Multiple cores were simultaneously updating adjacent floats within the same 64-byte cache line of the $y$ vector, causing the L1 cache coherence protocol to endlessly bounce the line between cores. 
+When we asked the AI to parallelize this directly, it applied \texttt{\#pragma omp} to the outer loop. This introduced a secondary problem: false sharing on output vector $y$—multiple threads writing adjacent elements in the same 64-byte line caused cache coherence overhead. 
 
-\textbf{Manual Intervention:} The AI required explicit human guidance to recast the transposition as a row-wise \texttt{saxpy} operation distributed over threads. By assigning each thread a slice of the output vector $y$, and iterating contiguously across the rows of $A$, we restored sequential memory access and full AVX2 vectorization.
+Reformulation: We proposed to rewrite the transposed form as a row-wise \texttt{saxpy}-like operation where each thread owns a slice of $y$ and iterates sequentially over rows. This eliminated both column-stride misses and false sharing.
 
-\paragraph{Failure: \texttt{ssymv} Branching.}
-For \texttt{ssymv}, the AI initially used a branched access \texttt{min(i,j)} to read the symmetric matrix, which entirely prevented vectorization. When instructed to split the loop into stored and reflected halves, performance barely improved (1.6\,GB/s vs OB 22\,GB/s) because the reflected half still suffered from column-stride cache misses. Resolving this would require a blocked panel scatter approach, which the AI could not independently derive.
+\paragraph{\texttt{ssymv} limit.}
+\textbf{Iteration 1.} AI generated a loop over the stored lower triangle with a conditional
+\texttt{if (j <= i)} guard. The branching prevented auto-vectorisation; single-thread throughput
+was 0.8\,GB/s.
+\textbf{Iteration 2.} We separated the diagonal, lower-triangle, and reflected (upper) accesses
+into three independent loops, enabling AVX2 on the lower part. Performance improved to
+1.6\,GB/s — still 14$\times$ below OpenBLAS (22\,GB/s). Root cause: the reflected part accesses
+column $j$ for all rows $i < j$, which strides by $\texttt{lda}$ bytes — each iteration fetches a new cache line for one float. This is the same column-stride pathology as \texttt{sgemv} Transpose.
+Fully resolving this requires a blocked panel layout: copying the symmetric matrix into a
+row-major packed panel so that the reflected accesses become row-wise.
+OpenBLAS implements exactly this strategy (BLIS-style packing), achieving near-bandwidth
+utilisation. We accepted the 0.07$\times$ result as a documented architectural limitation.
 
-\section{Performance Evaluation}
+\section{BLAS~2 performance evaluation}
 
 \begin{figure}[h]
 \centering
@@ -795,7 +931,7 @@ For \texttt{ssymv}, the AI initially used a branched access \texttt{min(i,j)} to
   grid=major, grid style={dashed,gray!30},
   title={\texttt{ssyr2} Algorithmic Win (1T)},
   title style={font=\bfseries\scriptsize},
-  legend style={at={(0.02,0.98)},anchor=north west,font=\tiny},
+  legend style={at={(0.5,-0.35)},anchor=north,legend columns=2,font=\tiny},
 ]
 \addplot[fill=task2green] coordinates {(64,10.19) (256,29.56) (1024,27.94) (4096,13.38)};
 \addplot[fill=oborange] coordinates {(64,5.55) (256,15.21) (1024,18.83) (4096,11.27)};
@@ -816,7 +952,7 @@ For \texttt{ssymv}, the AI initially used a branched access \texttt{min(i,j)} to
   grid=major, grid style={dashed,gray!30},
   title={\texttt{sger} Scaling ($N=2048$)},
   title style={font=\bfseries\scriptsize},
-  legend style={at={(0.02,0.98)},anchor=north west,font=\tiny},
+  legend style={at={(0.5,-0.35)},anchor=north,legend columns=2,font=\tiny},
 ]
 \addplot[fill=ourblue] coordinates {(1T,35.98) (4T,141.31) (8T,287.48) (16T,266.38)};
 \addplot[fill=oborange] coordinates {(1T,36.49) (4T,141.96) (8T,284.80) (16T,498.91)};
@@ -837,7 +973,7 @@ For \texttt{ssymv}, the AI initially used a branched access \texttt{min(i,j)} to
   grid=major, grid style={dashed,gray!30},
   title={\texttt{ssymv} Bottleneck ($N=1024$)},
   title style={font=\bfseries\scriptsize},
-  legend style={at={(0.02,0.98)},anchor=north west,font=\tiny},
+  legend style={at={(0.5,-0.35)},anchor=north,legend columns=2,font=\tiny},
 ]
 \addplot[fill=taskred] coordinates {(1T,1.61) (4T,3.89) (8T,7.06) (16T,13.35)};
 \addplot[fill=oborange] coordinates {(1T,22.79) (4T,71.71) (8T,93.09) (16T,92.43)};
@@ -849,40 +985,126 @@ For \texttt{ssymv}, the AI initially used a branched access \texttt{min(i,j)} to
 \label{fig:blas2_plots}
 \end{figure}
 
-\paragraph{Analysis of OpenBLAS Advantage.}
-While we beat OpenBLAS in \texttt{ssyr2} and matched it in \texttt{sger}, OpenBLAS heavily outperforms us in \texttt{sgemv} Transpose and \texttt{ssymv}. The reason is cache-blocking: OpenBLAS uses assembly-level panel loops that fetch a block of matrix $A$ into the L2 cache, then compute multiple elements of the output simultaneously. Our \texttt{\#pragma omp parallel for} processes one row at a time. This becomes a major bottleneck for transposed or symmetric accesses where our row-wise pattern degrades to column-wise cache misses. Furthermore, at $N=2048$ with 16 threads, \texttt{sger} OpenBLAS reaches 498\,GB/s compared to our 266\,GB/s, indicating that its NUMA-aware first-touch memory policy leverages the 20-core dual-socket architecture far better than our naive OpenMP distribution.
+\paragraph{OpenBLAS comparison.}
+While we beat OpenBLAS in \texttt{ssyr2} and matched it in \texttt{sger}, OpenBLAS heavily outperforms us in \texttt{sgemv} Transpose and \texttt{ssymv}. The reason is cache-blocking: OpenBLAS uses assembly-level panel loops that fetch a block of matrix $A$ into the L2 cache, then compute multiple elements of the output simultaneously. Our \texttt{\#pragma omp parallel for} processes one row at a time. This becomes a major bottleneck for transposed or symmetric accesses where our row-wise pattern degrades to column-wise cache misses. Furthermore, at $N=2048$ with 16 threads, \texttt{sger} OpenBLAS reaches 498\,GB/s compared to our 266\,GB/s. Note that these values reflect \emph{L3 aggregate bandwidth} (the $N=2048$ matrix occupies $\sim$16\,MB, fitting entirely within the 25\,MB L3), not DDR4 bandwidth; the 498\,GB/s figure is physically plausible given the L3 internal bandwidth on a 20-core Xeon. The gap suggests OpenBLAS's NUMA-aware first-touch memory policy distributes data across the 20-core ring more evenly than our naive OpenMP scheduling.
+
+\paragraph{Hardware peak utilization (BLAS~2).}
+For BLAS~2 kernels, the relevant ceiling is L3 bandwidth for in-cache sizes. Table~\ref{tab:blas2_peak} shows single-thread utilization at $N=512$.
+
+\begin{table}[h]
+\centering
+\caption{BLAS~2 single-thread bandwidth utilisation ($N=512$, data in L3).
+  L3 single-thread bandwidth $\approx 50$\,GB/s (ring bus, 1 core).}
+\label{tab:blas2_peak}
+\small
+\begin{tabular}{llrr}
+\toprule
+Kernel & Result (1T) & L3 1T ceiling & \% peak \\
+\midrule
+\texttt{sger}   & 36\,GB/s  & 50\,GB/s & 72\% \\
+\texttt{ssyr2}  & 30\,GB/s  & 50\,GB/s & 60\% \\
+\texttt{ssyr}   & 20\,GB/s  & 50\,GB/s & 40\% \\
+\texttt{sgemv}  (NoTrans) & 31\,GB/s  & 50\,GB/s & 62\% \\
+\texttt{ssymv}  & 1.6\,GB/s & 50\,GB/s & 3\% \\
+\bottomrule
+\multicolumn{4}{l}{L3 single-core BW estimated from \texttt{sscal} single-thread = 19.5\,GB/s $\times$ r/w = $\approx$50\,GB/s.}
+\end{tabular}
+\end{table}
+
+\noindent \texttt{ssymv} at 3\% peak confirms the column-stride cache pathology identified above; all other kernels operate at 40--72\% of the single-core L3 bandwidth ceiling.
+
+\section{BLAS~2 AI development audit}
+
+\begin{table}[h]
+\centering
+\caption{AI success/failure log for BLAS~2 (7 kernels).}
+\label{tab:blas2_ai_audit}
+\small
+\begin{tabular}{p{4.5cm}p{2cm}p{7cm}}
+\toprule
+Task & Result & Notes \\
+\midrule
+\texttt{sgemv} NoTrans (row-wise loop)
+  & \textbf{Success}
+  & Correct AVX2 inner product per row; good prefetcher behaviour. \\
+\texttt{sgemv} Transpose (naive column loop)
+  & \textbf{\color{red}Failure}
+  & 1.7\,GB/s vs.\ expected 32\,GB/s; column-stride miss pattern. \\
+\texttt{sgemv} Transpose (row-wise saxpy reformulation)
+  & \textbf{Success}
+  & After human diagnosis, AI rewrote correctly; performance recovered. \\
+\texttt{sgemv} Transpose parallelisation (naive outer loop)
+  & \textbf{\color{red}Failure}
+  & False sharing on output vector $y$ (adjacent elements in same cache line). \\
+\texttt{sger} (row-streaming AVX2)
+  & \textbf{Success}
+  & Row-major access pattern; reached 38--39\,GB/s (DDR4 ceiling). \\
+\texttt{ssymv} (separated lower/reflected loops)
+  & \textbf{Partial}
+  & Correct, but reflected half retains column-stride misses. \\
+\texttt{ssyr} (lower-triangle update)
+  & \textbf{Success}
+  & AVX2 per-row FMA; 40\% L3 utilisation. \\
+\texttt{ssyr2} (naive: two rank-1 passes)
+  & \textbf{Success}
+  & Correct but 2$\times$ bandwidth overhead. \\
+\texttt{ssyr2} fusion (dual FMA, single pass)
+  & \textbf{Success}
+  & AI proposed fusion when asked to minimise bandwidth; 2.2$\times$ win. \\
+\texttt{strmv}, \texttt{strsv}
+  & \textbf{Success}
+  & Triangular access patterns generated correctly on first attempt. \\
+\midrule
+\multicolumn{3}{l}{\textbf{2 failures / 1 partial / 7 successes in 10 tasks. All failures caught by benchmarks.}} \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 %%============================================================
 \newpage
 \part{Testing and Agentic Optimization}
 %%============================================================
 
-\section{Testing Methodology: Numerical Stability}
+\section{Testing and numerical stability}
 
 Validating high-performance floating-point math requires far more than simple equality checks. To ensure the unquestionable correctness of all BLAS~1, 2, and 3 kernels against edge cases and numerical instability, we developed a sophisticated automated C testbench.
 
-\paragraph{The Danger of Uniform Random Matrices.}
+\paragraph{Uniform random matrices.}
 The most common mistake in testing linear algebra software is populating matrices with uniform random numbers, $U(-1, 1)$. For operations like triangular solvers (\texttt{strsm, strsv}), a uniformly populated matrix has a condition number $\kappa(A)$ that grows exponentially with the matrix dimension $N$. 
 In floating-point arithmetic, the relative error of the output is bounded by $\epsilon \cdot \kappa(A)$, where $\epsilon$ is machine precision ($\approx 10^{-7}$ for FP32). For $N=512$, $\kappa(A)$ easily exceeds $10^6$, causing the solver to amplify tiny roundoff errors into massive macroscopic differences, causing completely valid code to fail the tests.
 
-\paragraph{Engineered Matrix Conditioning.}
+\paragraph{Matrix conditioning.}
 To solve this, our testbench utilizes specialized data generators:
 \begin{itemize}
     \item \textbf{Positive-Definiteness (\texttt{rand\_symm})}: For symmetric operations, we generate diagonally dominant symmetric matrices. We populate the matrix with $U(0,1)$, mirror it, and then add $N$ to the diagonal. This guarantees positive eigenvalues and absolute numerical stability.
     \item \textbf{Well-Conditioned Triangular (\texttt{rand\_tri})}: For solvers, we restrict off-diagonal elements to $0.01 \cdot U(0,1)$, while forcing the main diagonal to $2.0 + U(0,1)$. This restricts the condition number to $O(1)$, completely isolating algorithm flaws from mathematical artifacts.
 \end{itemize}
 
-\paragraph{Handling Non-Associative Multi-Threading.}
+\paragraph{Parallel reduction tolerance.}
 Floating-point addition is not associative: $(a+b)+c \neq a+(b+c)$. Because our OpenMP implementations divide matrices across cores and accumulate partial sums in an unpredictable order, our results will legitimately differ from the sequential OpenBLAS reference.
 To handle this, the testbench enforces a strict relative tolerance check:
 $$ \frac{|x_{\text{ours}} - x_{\text{ref}}|}{\max(|x_{\text{ours}}|, |x_{\text{ref}}|) + 10^{-6}} \le \text{tol} $$
 For standard operations, $\text{tol} = 10^{-3}$. For deep reduction operations like \texttt{ssyrk} where thousands of products are accumulated in parallel, the tolerance is safely relaxed to $5\times10^{-3}$. All 1287 BLAS 1 and 118 BLAS 2/3 test cases pass under these conditions.
 
-\section{The Autonomous Agent Loop Architecture}
+\section{Agent loop}
 
-A cornerstone of this project was the development of the "Agent Loop" (\texttt{agent\_loop.py} and \texttt{sgemm\_tuner.py})---an autonomous Python framework designed to iteratively compile, benchmark, and optimize C code by directly navigating the multidimensional hardware parameter space.
+A cornerstone of this project was the development of the ``Agent Loop'':
+two complementary Python scripts that together form an autonomous
+compile-benchmark-optimise cycle.
+\texttt{sgemm\_tuner.py} implements the three black-box search algorithms
+described in \S3 (Gradient Descent, Bayesian Optimisation, Simulated
+Annealing); it treats the SGEMM kernel as a pure function from block-size
+parameters $(\text{MC}, \text{KC}, \text{NC})$ to measured GF/s.
+\texttt{agent\_loop.py} wraps \texttt{sgemm\_tuner.py} into an end-to-end
+pipeline: it writes a C header with the chosen parameters, invokes
+\texttt{make}, runs the benchmark binary, parses the output, and feeds the
+result back to the tuner --- all without human intervention. This is the
+``agentic'' aspect: the human sets a budget (number of evaluations) and the
+loop runs until convergence or budget exhaustion.
 
-\paragraph{Search Space and Mechanisms.}
+The loop was designed to compile, benchmark, and optimize C code by navigating the hardware parameter space.
+
+\paragraph{Search space and updates.}
 The loop explored critical micro-architectural variables that are notoriously difficult for humans to manually tune:
 \begin{itemize}
     \item \textbf{Loop Unrolling Factors}: Testing 1$\times$, 2$\times$, 4$\times$, and 8$\times$ inner-loop unrolling to balance instruction cache sizes against pipeline depth.
@@ -890,20 +1112,20 @@ The loop explored critical micro-architectural variables that are notoriously di
     \item \textbf{Cache Blocking (\texttt{MC, KC, NC})}: Sizing the BLIS macro-blocks to ensure panels fit precisely within the $32$\,KB L1, $256$\,KB L2, and shared $25$\,MB L3 caches without suffering eviction.
 \end{itemize}
 
-\paragraph{Success: Bayesian Optimization.}
-During Week 3, we deployed a sophisticated Bayesian Optimizer to tune the SGEMM block sizes. Unlike random search, the Bayesian Optimizer builds a probabilistic surrogate model (a Gaussian Process) of the performance landscape. It selects the next configuration to test by maximizing the \textit{Expected Improvement} (EI) acquisition function, inherently balancing the exploration of unknown parameters against the exploitation of known fast parameters.
-This rigorous mathematical approach successfully navigated a flat, noisy performance landscape to find non-obvious, non-power-of-two optimal block sizes (\texttt{MC=480, KC=256, NC=10432}). This autonomous discovery secured a 4\% speedup over the mathematically derived GotoBLAS defaults.
+\paragraph{Bayesian optimization.}
+In Week 3, a Bayesian Optimizer was deployed to tune SGEMM block sizes. The optimizer builds a Gaussian Process surrogate model of the performance landscape and selects configurations by maximizing Expected Improvement (EI), balancing exploration of unknown parameters with exploitation of fast configurations.
 
-\paragraph{Limitations of Black-Box Optimization.}
-The agent loop revealed the absolute limits of parameter tuning. When faced with fundamental structural flaws---such as the $O(\mu s)$ overhead of spawning \texttt{\#pragma omp taskloop} tasks for microsecond-scale work, or the column-stride cache thrashing in \texttt{ssymv}---no amount of parameter tweaking could salvage the performance. Black-box optimizers like Simulated Annealing flailed hopelessly because modifying a prefetch distance on a severely bottlenecked algorithm yields zero measurable difference, creating a perfectly flat gradient.
+The optimization discovered non-power-of-two block sizes (\texttt{MC=480, KC=256, NC=10432}) that are difficult to find by manual tuning, achieving 4\% speedup over mathematically derived GotoBLAS defaults.
 
-\paragraph{Overall Efficacy Conclusion.}
+\paragraph{Black-box limits.}
+The agent loop also showed where parameter tuning is insufficient. For structural bottlenecks, such as $O(\mu s)$ task creation overhead for microsecond-scale \texttt{taskloop} work or column-stride misses in \texttt{ssymv}, changing prefetch distance or unroll factors has little effect. In practice, this creates a near-flat search landscape for methods such as Simulated Annealing.
+
+\paragraph{Overall effect.}
 The autonomous agent loop was responsible for recovering the final \textbf{10--15\% of hardware performance}. It acted as a crucial polishing tool, pushing algorithmically sound AVX2 code to the ultimate ceiling of the silicon (reaching 104\%--117\% of the un-tuned baselines). However, the foundational 85\% of the performance gains were strictly the domain of intelligent, AI-guided architectural redesigns: fusing loops, recasting memory access patterns, and selecting lightweight synchronization primitives.
 
 %%============================================================
 \newpage
-\section*{Conclusion}
-\addcontentsline{toc}{section}{Conclusion}
+\section{Results Summary}
 %%============================================================
 
 \begin{table}[h]
@@ -922,13 +1144,182 @@ strmm    & \multicolumn{3}{l}{correct, $\sim$0.15$\times$} & --- & Buffer copy\\
 \end{tabular}
 \end{table}
 
-\paragraph{Key lessons from Part~1.}
-SGEMM at 20 threads outperforms OpenBLAS by 1.3--2.5$\times$ for medium-to-large
-matrices due to better thread-count balancing. At single thread, we reach
-73--95\% of peak, compared to OpenBLAS's 71--105\%. The autotuning improvement
-over a hand-tuned default is only 4\% on this kernel, because the BLIS tiling
-strategy already places the implementation near the roofline optimum. The AI's
-main failure modes were: argument-layout mismatches in BLAS API calls, wrong
-OpenMP primitive selection, and platform-specific assembly constraints.
+\paragraph{BLAS~1 on this workload.}
+Our BLAS~1 implementation is faster than OpenBLAS on the tested multi-core setting, with up to \textbf{1658$\times$} on 8-thread \texttt{snrm2} at $N = 10^6$. A practical explanation is workload specialization: OpenBLAS is usually conservative for BLAS~1 threading, while our kernels explicitly target large cache-resident vectors where multi-core L3 consumption is beneficial. This highlights a familiar trade-off between general-purpose defaults and workload-specific tuning.
+
+\paragraph{BLAS~1 scaling.}
+At single-thread, AVX2 contributes 4--9$\times$ speedup for reduction operations (latency hiding via multiple accumulators) and 0--1$\times$ for bandwidth-limited operations. Adding 8-thread OpenMP yields an additional 7--8$\times$ improvement, resulting in combined speedups of 30--70$\times$ over the scalar baseline for reduction-heavy kernels. At 20 threads on the full machine, some kernels scale sublinearly (ssymv reaches only 13.35\,GB/s at 16T, likely due to NUMA effects), while others like sscal exceed the DDR4 sustained bandwidth limit (134.4\,GB/s on 8T, $\sim 7 \times$ single-thread).
+
+\paragraph{BLAS~2 results.}
+BLAS~2 made clear where algorithmic improvements are enough and where architecture dominates. In \texttt{ssyr2}, fused updates achieved up to 2.2$\times$ speedup (single-pass dual FMA instead of two rank-1 passes). In contrast, \texttt{ssymv} (0.07$\times$ vs OpenBLAS) remains limited by access pattern: OpenBLAS uses panel blocking with better cache reuse, while our row-wise implementation still suffers from column-stride misses. Closing this gap would require a different blocked design and likely lower-level kernel work.
+
+\paragraph{BLAS~3 results and tuning.}
+SGEMM at 20 threads outperforms OpenBLAS by \textbf{1.3--2.5$\times$} for medium-to-large matrices ($N \ge 256$) due to better thread-count balancing across the 20-core machine. At single-thread, we reach 73--95\% of peak (56\,GFLOP/s), compared to OpenBLAS's 71--105\%. The autotuning improvement over hand-tuned defaults is only 4\% (from 64.3\,GF/s to 66.92\,GF/s), indicating that the BLIS tiling strategy places the implementation already near the roofline limit. Bayesian optimization successfully identified non-obvious block sizes (\texttt{MC=480}), but the gains are strictly marginal because the fundamental loop structure is already sound.
+
+\section{AI-assisted development}
+
+\subsection*{What worked}
+
+The BLIS 5-loop framework (correct loop nesting, packing buffers, pointer arithmetic)
+came out right on the first attempt and compiled without modification.
+Reaching the same point by reading the Goto and Van Zee papers alone
+would have taken at least two days; with the AI it took an afternoon.
+The 6$\times$16 and 4$\times$24 micro-kernels were also correct on the first try,
+including the register pressure analysis.
+
+For reduction kernels (\texttt{sdot}, \texttt{snrm2}, \texttt{sasum}), the AI
+independently used four independent accumulators without being asked.
+This is the right technique for hiding 5-cycle FMA latency, and the AI had
+apparently internalized it from context.
+
+The \texttt{ssyr2} fusion was the most useful AI-generated insight.
+When asked to minimise memory traffic, the AI proposed collapsing two rank-1
+passes into one, halving the number of reads and writes to $A$.
+The suggestion required understanding both the mathematical identity
+$\alpha xy^T + \alpha yx^T = $ single loop and how to express it with dual FMAs.
+The result was a 2.2$\times$ speedup over OpenBLAS.
+
+The testbench also came out well: diagonally-dominant matrix construction, relative
+tolerance for parallel reductions, clear error messages.
+These are the parts of numerical testing that are easy to get wrong,
+and the AI got them right.
+
+\subsection*{Where it failed}
+
+The recurring failure mode was that the AI could not predict hardware behavior
+before seeing a benchmark.
+
+\textit{Task parallelism.}
+The AI proposed \texttt{omp taskloop collapse(2)} for GEMM tile dispatch.
+At $N=128^3$, this was 14$\times$ slower than \texttt{parallel for}.
+The reason: each tile takes $<$10\,$\mu$s, task creation overhead is $\sim$1\,$\mu$s,
+and there are hundreds of tiles per matrix.
+When we showed the benchmark result, the AI suggested increasing tile size.
+We switched to loop parallelism and the problem disappeared.
+
+\textit{Column-stride access in sgemv Transpose.}
+The AI wrote the mathematically natural formulation:
+iterate over columns of $A^T$, accumulate into $y$.
+In a row-major layout, this strides by \texttt{lda} bytes per inner iteration,
+fetching a new 64-byte cache line for every 4 bytes used.
+Measured throughput: 1.7\,GB/s versus OpenBLAS's 32\,GB/s.
+The AI's diagnosis was "try prefetching the next column."
+The actual fix was rewriting the algorithm: iterate over rows of $A$
+and accumulate partial contributions to all of $y$ via saxpy-style updates.
+Once we described this, the AI implemented it correctly.
+The lesson is not that the AI failed, but that it cannot make this diagnosis
+from a performance number alone.
+
+\textit{False sharing.}
+After reformulating sgemv Transpose, we asked the AI to parallelise it with
+\texttt{omp parallel for} over the outer loop.
+Performance did not improve.
+The cause: threads writing adjacent elements of $y$ in the same 64-byte cache
+line, triggering coherence invalidation.
+The fix was assigning contiguous chunks of $y$ to each thread
+(private output ranges, no shared cache lines).
+The AI implemented this once we identified the issue; it could not identify it
+from the symptoms.
+
+\textit{Assembly operand limits.}
+GCC's extended inline assembly supports at most 30 named operands.
+The AI generated a 32-operand block for the 6$\times$16 kernel.
+The fix was computing the loop counter inside the asm block with a shift
+instruction rather than passing it as a named constraint.
+This is not in any standard reference, and the AI did not know the limit
+until the compiler reported it.
+
+\subsection*{What would have helped}
+
+Two changes would have compressed the iteration cycles significantly.
+
+First: direct benchmark access.
+Each iteration took 30--60 seconds on our end (compile, run, read output,
+summarise, prompt).
+The AI could not observe the output directly.
+For performance debugging, this meant describing symptoms in text rather
+than sharing a hardware counter trace.
+If the AI had been able to compile and run the benchmark autonomously,
+most of the failures above would have been caught in minutes rather than hours.
+
+Second: hardware latency models.
+The AI has no internalized model of DDR4 access latency ($\sim$60\,ns),
+L3 ring bandwidth as a function of active core count, or NUMA first-touch
+allocation policy.
+Every time we said "this access pattern will miss caches on this machine,"
+the AI could produce a correct fix.
+But it could not say that unprompted.
+A lightweight hardware model, even an approximate one, would have caught
+the column-stride and taskloop failures before any code was written.
+
+\subsection*{Reflections}
+
+Looking at the six weeks overall, the AI shortened the scaffolding phase
+(framework generation, SIMD boilerplate, test infrastructure) by roughly half.
+For the optimization phase, it was more useful as an executor than a diagnostician:
+we identified what needed to change, the AI wrote the code.
+
+The concern about passive learning is real but nuanced.
+The AI-generated code that just worked taught us less than the code that failed.
+The taskloop overhead, column-stride pathology, and false sharing are things
+we now understand precisely because we had to trace them by hand.
+In that sense the failures were not a cost of using AI; they were the part
+of the project with the highest educational density.
+
+\section{Conclusion}
+
+We built a working BLAS library over six weeks using AI-assisted development
+and measured its performance against OpenBLAS across 19 kernels.
+SGEMM at 20 threads beats OpenBLAS by 1.3--2.5$\times$ for medium-to-large matrices,
+largely because our adaptive tile-count balancing distributes work more evenly
+across 20 cores than the system OpenBLAS build.
+BLAS~1 kernels on large cache-resident vectors outperform single-threaded OpenBLAS
+by large factors, though this comparison is not entirely fair since OpenBLAS
+does not thread BLAS-1 by default.
+BLAS~2 showed both an algorithmic win (\texttt{ssyr2}, 2.2$\times$ via fusion)
+and a clear architectural ceiling (\texttt{ssymv}, 0.07$\times$ due to
+column-stride cache misses we did not resolve).
+
+The consistent pattern across all three levels was this:
+the AI produced correct code quickly when the algorithm was well-specified,
+and produced plausible-but-wrong code when the bottleneck was hardware-dependent.
+Closing the gap between "plausible" and "fast" required measurement, diagnosis,
+and reformulation, all done by hand.
+The agent loop recovered the final 10--15\% once the algorithms were structurally sound,
+which was the right division of labour: black-box optimization cannot fix a
+fundamentally wrong access pattern, and manual tuning cannot search a 5D parameter
+space in a reasonable time.
+
+%%============================================================
+\begin{thebibliography}{9}
+
+\bibitem{blis}
+  F.\ G.\ Van Zee and R.\ A.\ van de Geijn,
+  ``BLIS: A Framework for Rapidly Instantiating BLAS Functionality,''
+  \textit{ACM Transactions on Mathematical Software}, 41(3), 2015.
+
+\bibitem{goto}
+  K.\ Goto and R.\ A.\ van de Geijn,
+  ``Anatomy of High-Performance Matrix Multiplication,''
+  \textit{ACM Transactions on Mathematical Software}, 34(3), 2008.
+
+\bibitem{openblas}
+  Z.\ Xianyi, W.\ Qian, and W.\ Yunquan,
+  ``Model-driven Level~3 BLAS Performance Optimization on Loongson~3A
+  Processor,'' \textit{ICPADS}, 2012.
+  OpenBLAS: \url{https://www.openblas.net}.
+
+\bibitem{intel_intrinsics}
+  Intel Corporation,
+  ``Intel Intrinsics Guide,''
+  \url{https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html},
+  accessed May 2026.
+
+\bibitem{williams_roofline}
+  S.\ Williams, A.\ Waterman, and D.\ Patterson,
+  ``Roofline: An Insightful Visual Performance Model for Multicore
+  Architectures,'' \textit{Communications of the ACM}, 52(4), 2009.
+
+\end{thebibliography}
 
 \end{document}
