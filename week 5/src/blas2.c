@@ -56,9 +56,9 @@ void sgemv(char trans, int m, int n, float alpha, const float *a, int lda,
 
     if (!ta) {
         /* --- NoTrans: y[i] += alpha * dot(A[i,:], x) --- */
-        #pragma omp parallel
-        #pragma omp single
-        #pragma omp taskloop grainsize(1)
+        /* Parallelise only when matrix is large enough to amortise ~5 µs
+         * thread-launch overhead; below ~N=1024 single thread is faster. */
+        #pragma omp parallel for schedule(static) if((long long)m * n >= 512 * 1024)
         for (int i = 0; i < m; i++) {
             const float *Ar = a + (size_t)i * lda;
             float sum = 0.0f;
@@ -139,9 +139,7 @@ void sger(int m, int n, float alpha, const float *x, int incx,
 {
     if (m <= 0 || n <= 0 || alpha == 0.0f) return;
 
-    #pragma omp parallel
-    #pragma omp single
-    #pragma omp taskloop grainsize(8)
+    #pragma omp parallel for schedule(static) if((long long)m * n >= 512 * 1024)
     for (int i = 0; i < m; i++) {
         float axi = alpha * x[i * incx];
         float *Ar = a + (size_t)i * lda;

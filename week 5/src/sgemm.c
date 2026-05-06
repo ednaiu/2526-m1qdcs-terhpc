@@ -154,6 +154,21 @@ static void sgemm_task1(int M, int N, int K,
     }
 
     int nr_ic = (M + MC - 1) / MC;
+
+    /* NC adaptation: if the total 2-D tile count is too low to saturate
+     * all threads, shrink NC so more N-tiles are created.  This directly
+     * mirrors the MC adaptation above and fixes poor scaling when N < NC.
+     * We target at least nthd*2 tiles total so every thread gets work. */
+    if (N >= NR * 2) {
+        int nr_jc_cur = (N + NC - 1) / NC;
+        if ((long long)nr_jc_cur * nr_ic < (long long)nthd * 2) {
+            int NC_new = N / (nthd * 2);
+            NC_new = (NC_new / NR) * NR;
+            if (NC_new < NR) NC_new = NR;
+            NC = NC_new;
+        }
+    }
+
     size_t packed_A_stride = (size_t)((MC+MR-1)/MR) * KC * MR;
     float *packed_A_all = (float *)aligned_alloc(64, (size_t)nr_ic * packed_A_stride * sizeof(float));
     float *packed_B = (float *)aligned_alloc(64, (size_t)((NC+NR-1)/NR) * KC * NR * sizeof(float));
@@ -177,17 +192,17 @@ static void sgemm_task1(int M, int N, int K,
                     pack_A_panel(A+ic*lda+pc, lda, packed_A_all + (size_t)ic_idx*packed_A_stride, M_blk, K_blk, MR);
                 }
 
-                #pragma omp single
-                {
-                    #pragma omp taskloop collapse(2) grainsize(1)
-                    for (int ic_idx = 0; ic_idx < nr_ic; ic_idx++) {
-                        for (int jt = 0; jt < nr_jt; jt++) {
-                            int ic = ic_idx * MC;
-                            int M_blk = (ic + MC <= M) ? MC : (M - ic);
-                            int N_curr = (jt * NR + NR <= N_blk) ? NR : (N_blk - jt * NR);
-                            macro_kernel(packed_A_all + (size_t)ic_idx*packed_A_stride, packed_B + (size_t)jt*K_blk*NR,
-                                         C + ic*ldc + jc + jt*NR, M_blk, K_blk, N_curr, MR, NR, alpha, beta_k, ldc, kfn, cfg->use_nt_store);
-                        }
+                /* Replace single{taskloop} with omp for: eliminates the
+                 * task-descriptor allocation and work-stealing overhead that
+                 * serialises 2304 tasks before any computation begins at 8T. */
+                #pragma omp for collapse(2) schedule(static)
+                for (int ic_idx = 0; ic_idx < nr_ic; ic_idx++) {
+                    for (int jt = 0; jt < nr_jt; jt++) {
+                        int ic = ic_idx * MC;
+                        int M_blk = (ic + MC <= M) ? MC : (M - ic);
+                        int N_curr = (jt * NR + NR <= N_blk) ? NR : (N_blk - jt * NR);
+                        macro_kernel(packed_A_all + (size_t)ic_idx*packed_A_stride, packed_B + (size_t)jt*K_blk*NR,
+                                     C + ic*ldc + jc + jt*NR, M_blk, K_blk, N_curr, MR, NR, alpha, beta_k, ldc, kfn, cfg->use_nt_store);
                     }
                 }
             }
@@ -341,8 +356,20 @@ void sgemm_ex(int M, int N, int K, float alpha, const float *A, int lda, const f
 
     if (mode == PARALLEL_DYNAMIC) {
         int nthd = (cfg->nb_threads > 0) ? cfg->nb_threads : omp_get_max_threads();
+        int MR_d, NR_d; kernel_get_mr_nr(dynamic_cfg.kernel, &MR_d, &NR_d);
         int nr_ic = (M + cfg->MC - 1) / cfg->MC;
-        int nr_jc = (N + cfg->NC - 1) / cfg->NC;
+        int nr_jc = (N + dynamic_cfg.NC - 1) / dynamic_cfg.NC;
+
+        /* NC adaptation: if too few 2-D tiles to saturate all threads and N
+         * is smaller than the default NC, shrink NC to create more N-tiles.
+         * This prevents unnecessary fallback to the 3-D task mode. */
+        if (nr_jc * nr_ic < nthd && N >= NR_d * 2) {
+            int NC_new = (N / nthd / NR_d) * NR_d;
+            if (NC_new < NR_d) NC_new = NR_d;
+            dynamic_cfg.NC = NC_new;
+            nr_jc = (N + NC_new - 1) / NC_new;
+        }
+
         int total_2d_tiles = nr_ic * nr_jc;
 
         if (total_2d_tiles < nthd && K > cfg->KC) {
