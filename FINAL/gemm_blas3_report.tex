@@ -64,10 +64,10 @@ kernels are competitive, where they fall short, and why.
 \subsection*{Scope of Development}
 The project spans six weeks of systematic, iterative development, categorized as follows:
 \begin{itemize}
-  \item \textbf{Part~1 (Weeks 1--3 \& 6): GEMM and BLAS~3.} The core focus is SGEMM (Single-Precision General Matrix Multiply), implementing the sophisticated BLIS (BLAS-like Library Instantiation Software) 5-loop architecture. This part also covers autotuning infrastructures and derived BLAS~3 operations (\texttt{ssyrk, strsm, strmm}).
+  \item \textbf{Part~1 (Weeks 1--3 \& 6): GEMM and BLAS~3.} The core focus is SGEMM, implemented via the BLIS (BLAS-like Library Instantiation Software) 5-loop architecture. This part also covers autotuning and derived BLAS~3 operations (\texttt{ssyrk, strsm, strmm}).
   \item \textbf{Part~2 (Week 4): BLAS~1.} Implementation of foundational vector-vector operations (\texttt{sscal, scopy, sswap, saxpy, sdot, snrm2, sasum, isamax, srot}), pushing single-thread and multi-thread memory bandwidth limits.
   \item \textbf{Part~3 (Week 5): BLAS~2.} Implementation of matrix-vector operations (\texttt{sgemv, ssymv, strmv, strsv, sger, ssyr, ssyr2}), focusing on cache-friendly access patterns and algorithmic optimizations like loop fusion.
-  \item \textbf{Part~4: Testing and Agentic Optimization.} Development of the rigorous numerical validation testbench and the autonomous parameter-tuning agent loop.
+  \item \textbf{Part~4: Testing and Optimization.} Numerical validation testbench and an autonomous compile-benchmark-tune agent loop for SGEMM block-size search.
 \end{itemize}
 
 \subsection*{Hardware Architecture and Theoretical Limits}
@@ -147,7 +147,7 @@ L3 aggregate bandwidth   & ---           & 491\,GB/s   & ---  & \texttt{sger} $2
 
 \subsection{BLIS framework}
 
-Matrix multiplication $C = \alpha A B + \beta C$ requires $O(N^3)$ operations but only $O(N^2)$ data. By carefully orchestrating memory access, we can achieve an arithmetic intensity (FLOPs per byte transferred) high enough to keep the AVX2 ALUs constantly fed without stalling on main memory.
+Matrix multiplication $C = \alpha A B + \beta C$ requires $O(N^3)$ arithmetic but only $O(N^2)$ data. With proper tiling, the arithmetic intensity (FLOPs per byte) is high enough that the AVX2 FMA units, not memory, become the bottleneck.
 
 We adopted the BLIS architecture, which decomposes the GEMM operation into five nested loops surrounding a highly optimized hardware-specific micro-kernel. 
 \begin{enumerate}
@@ -173,7 +173,7 @@ Single-thread performance on a $1024^3$ matrix reached $\sim$40\,GF/s (54\% of t
 \subsection{Week~2 micro-kernels and parallelism}
 
 \paragraph{Register-bound micro-kernels (6$\times$16 and 4$\times$24).}
-To improve the ratio of memory loads to arithmetic operations, the AI was instructed to maximize the use of the 16 YMM registers. Two new kernels were successfully generated:
+To improve the ratio of FMAs to memory loads, the AI was prompted to maximise use of the 16 YMM registers. Two kernels were produced:
 \begin{itemize}
   \item \textbf{6$\times$16 Micro-kernel}: $MR=6$ output \emph{rows}, $NR=16$ output columns. For each $k$-step, each of the 6 rows of $A$ contributes a \emph{scalar broadcast} (one YMM register, reused across the $NR/8=2$ FMA chains); $B$ is loaded as $NR/8 = 2$ YMM vectors. The output accumulator block requires $MR \times (NR/8) = 6 \times 2 = 12$ YMM registers. Total register pressure: $12 \text{ (C accumulators)} + 2 \text{ (B)} + 1 \text{ (A broadcast)} = 15$ YMM, leaving 1 free. Each $k$-step performs $6 \times 2 = 12$ FMAs ($= 24$\,FLOPs).
   \item \textbf{4$\times$24 Micro-kernel}: $MR=4$ output rows, $NR=24$ columns. Each of the 4 rows of $A$ is a scalar broadcast; $B$ requires $NR/8 = 3$ YMM loads. Accumulator block: $4 \times 3 = 12$ registers. Total: $12 \text{ (C)} + 3 \text{ (B)} + 1 \text{ (A broadcast)} = 16$ YMM registers, perfectly saturating the AVX2 register file with zero register spills.
@@ -351,16 +351,15 @@ system build. Our MC auto-scaling ensures all threads receive balanced work.
 \label{sec:parallel}
 %%============================================================
 
-In Week 3, we successfully distributed SGEMM across multiple cores. In Week 4, we undertook a rigorous comparative analysis of \textbf{how} that work is distributed, comparing traditional Loop scheduling with modern Task scheduling models.
+Week 3 added multi-core parallelism to SGEMM. Week 4 compared two OpenMP scheduling models — loop-based and task-based — to understand their overhead characteristics.
 
 \subsection{Loop-based parallelism}
-Loop-based parallelism statically or dynamically slices a nested set of \texttt{for} loops and assigns exact ranges of iterations to specific threads. 
-\textit{Analogy}: An established assembly line where every worker knows exactly which widgets (tiles of matrix $C$) they are responsible for building before the shift even begins.
-Because the plan is made upfront and the iteration space is perfectly regular (a 2D grid), the OpenMP runtime overhead is virtually zero. 
+Loop-based parallelism statically or dynamically partitions a nested \texttt{for} loop and assigns contiguous iteration ranges to threads before execution begins.
+Because the work decomposition is determined at entry to the parallel region and the iteration space is a regular 2D grid, the OpenMP runtime overhead is $O(T)$ (one barrier per parallel region) and effectively zero per tile.
 
 \subsection{Task-based parallelism}
-Task-based parallelism treats every iteration (every tile of matrix $C$) as an independent "Task". A single master thread spawns these tasks, packing all the required variables (\texttt{firstprivate}) into a descriptor block in memory, and pushes them into a queue. Any idle thread can pop a task and execute it.
-\textit{Analogy}: A ticket-based kitchen line. When an order (tile) comes in, a ticket is printed. Any available chef can grab the next ticket and cook it. It is incredibly flexible for unbalanced workloads but requires time to print and read the tickets.
+Task-based parallelism treats each tile of $C$ as an independent work item. A master thread creates task descriptors — heap-allocated structs capturing all \texttt{firstprivate} variables — and pushes them into a runtime-managed queue; any idle thread dequeues and executes them.
+This model supports irregular workloads and dependency graphs (via \texttt{depend} clauses), but incurs per-task allocation and scheduling overhead proportional to the number of tiles.
 
 \subsection{Comparison and crossover}
 
@@ -388,7 +387,7 @@ $2048^3$ & \textbf{452.23} & 435.48 & 505.12 & \textbf{Task is 1.03$\times$ Slow
 For a $128 \times 128$ matrix, the work required to multiply a $6 \times 16$ tile is infinitesimal (measured in instructions). The time it takes OpenMP to allocate a block of memory, capture the local variables, push the task to a queue, and have a worker thread pop it is orders of magnitude larger than the math itself. \textbf{Task overhead completely dominates execution time.}
 
 \paragraph{Large matrices ($N \ge 1024$).}
-Matrix multiplication scales as $O(N^3)$ for computation, but only $O(N^2)$ for the number of grid tiles (tasks). Therefore, as the matrix grows, the time spent actually doing math inside the micro-kernel dwarfs the initial time spent printing the "task tickets". By $N=2048$, the overhead difference shrinks to merely $\sim$3.7\%.
+Matrix multiplication scales as $O(N^3)$ in arithmetic but only $O(N^2)$ in tile count. As $N$ grows, per-tile compute time dominates task-descriptor creation cost, and the two scheduling modes converge. By $N=2048$, the performance gap shrinks to $\sim$3.7\%.
 
 \begin{figure}[h]
 \centering
@@ -716,7 +715,7 @@ Test generator (\texttt{rand\_tri}) & \textbf{\color{red}Failure} & Ill-conditio
 
 \section{BLAS~1 implementation strategy}
 
-To explore BLAS~1 optimization, we undertook development of 9 vector kernels (\texttt{sscal}, \texttt{scopy}, \texttt{sswap}, \texttt{saxpy}, \texttt{sdot}, \texttt{snrm2}, \texttt{sasum}, \texttt{isamax}, \texttt{srot}). A key observation from prior HPC work is that BLAS~1 behaves fundamentally differently from BLAS~3: each is memory-bandwidth-bound with $O(1)$ arithmetic per byte, making vectorization and parallelization effects unpredictable without measurement.
+We implemented 9 vector kernels: \texttt{sscal}, \texttt{scopy}, \texttt{sswap}, \texttt{saxpy}, \texttt{sdot}, \texttt{snrm2}, \texttt{sasum}, \texttt{isamax}, \texttt{srot}. Unlike BLAS~3, BLAS~1 kernels are memory-bandwidth-bound with $O(1)$ arithmetic per byte, so the effect of vectorization and multi-threading depends on which bandwidth tier (L1/L2/L3/DRAM) the data occupies — this cannot be predicted without measurement.
 
 We asked the AI to generate all 9 kernels in parallel, using a staged approach: scalar baseline, then AVX2 vectorization, then OpenMP parallelism. The working hypothesis was that by comparing each stage, we could identify where each technique contributes and where it causes overhead.
 
@@ -809,9 +808,7 @@ Kernel & Metric & Scalar & AVX2 & Speedup over Scalar \\
 \end{table}
 
 \subsection*{Stage 3 multi-threading}
-We then tested the hypothesis: if single-threaded cores are L3-bandwidth-saturated, can we exploit the fact that L3 is shared among 8 cores? The idea is that L3 has much higher internal bandwidth than the DDR4 interface, and multiple threads reading from L3 might cooperatively saturate this internal bandwidth.
-
-Results confirmed this hypothesis dramatically: \texttt{sscal} reaches 134.4\,GB/s (7$\times$ single-threaded), \texttt{sdot} reaches 54.6\,GFLOP/s. By comparison, OpenBLAS remains at 18.1 and 7.5 respectively. Analysis suggests OpenBLAS deliberately avoids BLAS~1 threading for typical use (small vectors where thread overhead matters), while our large-vector workload ($N=10^6$ in 25\,MB L3) can amortize thread start/join costs. 
+Since L3 is shared across all cores and its internal ring bandwidth far exceeds the DDR4 interface, multiple threads can jointly saturate it for cache-resident vectors. For $N=2^{20}$ (4\,MB per array, resident in L3), the results confirm this: \texttt{sscal} reaches 134.4\,GB/s at 8T ($7\times$ single-threaded), \texttt{sdot} reaches 54.6\,GFLOP/s. OpenBLAS stays at 18.1\,GB/s and 7.5\,GFLOP/s because it does not thread BLAS-1 for this vector size by default. 
 
 To interpret these numbers relative to hardware: peak per-core is $2 \text{ FMA/cycle} \times 2.30\,\text{GHz} = 73.6\,\text{GFLOP/s}$. Single-threaded \texttt{sdot} reaches 7.3\,GFLOP/s (10\% of peak), confirming the bottleneck is memory bandwidth, not compute. Multi-threaded \texttt{sdot} at 54.6\,GFLOP/s redistributes the pressure onto aggregate L3 bandwidth.
 
@@ -1119,7 +1116,7 @@ Task & Result & Notes \\
 
 \section{Testing and numerical stability}
 
-Validating high-performance floating-point math requires far more than simple equality checks. To ensure the unquestionable correctness of all BLAS~1, 2, and 3 kernels against edge cases and numerical instability, we developed a sophisticated automated C testbench.
+We developed an automated C testbench covering all BLAS~1, 2, and 3 kernels. Three aspects required particular care: matrix conditioning, floating-point associativity, and coverage of non-unit strides and all transpose variants.
 
 \paragraph{Uniform random matrices.}
 The most common mistake in testing linear algebra software is populating matrices with uniform random numbers, $U(-1, 1)$. For operations like triangular solvers (\texttt{strsm, strsv}), a uniformly populated matrix has a condition number $\kappa(A)$ that grows exponentially with the matrix dimension $N$. 
@@ -1140,21 +1137,15 @@ For standard operations, $\text{tol} = 10^{-3}$. For deep reduction operations l
 
 \section{Agent loop}
 
-A cornerstone of this project was the development of the ``Agent Loop'':
-two complementary Python scripts that together form an autonomous
-compile-benchmark-optimise cycle.
+Two Python scripts implement an autonomous compile-benchmark-tune cycle.
 \texttt{sgemm\_tuner.py} implements the three black-box search algorithms
-described in \S3 (Gradient Descent, Bayesian Optimisation, Simulated
-Annealing); it treats the SGEMM kernel as a pure function from block-size
+described in \S3 (coordinate gradient descent, Bayesian optimisation, simulated
+annealing), treating the SGEMM kernel as a function from block-size
 parameters $(\text{MC}, \text{KC}, \text{NC})$ to measured GF/s.
-\texttt{agent\_loop.py} wraps \texttt{sgemm\_tuner.py} into an end-to-end
-pipeline: it writes a C header with the chosen parameters, invokes
-\texttt{make}, runs the benchmark binary, parses the output, and feeds the
-result back to the tuner --- all without human intervention. This is the
-``agentic'' aspect: the human sets a budget (number of evaluations) and the
-loop runs until convergence or budget exhaustion.
-
-The loop was designed to compile, benchmark, and optimize C code by navigating the hardware parameter space.
+\texttt{agent\_loop.py} wraps \texttt{sgemm\_tuner.py}: it writes a C header
+with the chosen parameters, invokes \texttt{make}, runs the benchmark binary,
+parses the output, and feeds the result back to the tuner.
+The user specifies an evaluation budget; the loop terminates on convergence or budget exhaustion.
 
 \paragraph{Search space and updates.}
 The loop explored critical micro-architectural variables that are notoriously difficult for humans to manually tune:
@@ -1173,7 +1164,7 @@ The optimization discovered non-power-of-two block sizes (\texttt{MC=480, KC=256
 The agent loop also showed where parameter tuning is insufficient. For structural bottlenecks, such as $O(\mu s)$ task creation overhead for microsecond-scale \texttt{taskloop} work or column-stride misses in \texttt{ssymv}, changing prefetch distance or unroll factors has little effect. In practice, this creates a near-flat search landscape for methods such as Simulated Annealing.
 
 \paragraph{Overall effect.}
-The autonomous agent loop was responsible for recovering the final \textbf{10--15\% of hardware performance}. It acted as a crucial polishing tool, pushing algorithmically sound AVX2 code to the ultimate ceiling of the silicon (reaching 104\%--117\% of the un-tuned baselines). However, the foundational 85\% of the performance gains were strictly the domain of intelligent, AI-guided architectural redesigns: fusing loops, recasting memory access patterns, and selecting lightweight synchronization primitives.
+The tuner recovered the final \textbf{10--15\% of hardware performance} over the manually chosen defaults (104\%--117\% of un-tuned baselines). The preceding 85\% of the gains came from algorithmic changes — loop restructuring, memory access pattern fixes, and scheduling primitive selection — which the black-box tuner cannot discover because they alter the code structure, not just numeric parameters.
 
 %%============================================================
 \newpage
@@ -1197,7 +1188,7 @@ strmm    & \multicolumn{3}{l}{correct, $\sim$0.15$\times$} & --- & Buffer copy\\
 \end{table}
 
 \paragraph{BLAS~1 on this workload.}
-Our BLAS~1 implementation is faster than OpenBLAS on the tested multi-core setting, with up to \textbf{1658$\times$} on 8-thread \texttt{snrm2} at $N = 10^6$. A practical explanation is workload specialization: OpenBLAS is usually conservative for BLAS~1 threading, while our kernels explicitly target large cache-resident vectors where multi-core L3 consumption is beneficial. This highlights a familiar trade-off between general-purpose defaults and workload-specific tuning.
+Our BLAS~1 implementation is faster than OpenBLAS at 8T, with up to \textbf{1658$\times$} on \texttt{snrm2} ($N = 10^6$). The ratio is large because OpenBLAS does not thread BLAS-1 operations by default (single-threaded reference), while our kernels use 8 threads on a workload that fits in L3. The comparison reflects a difference in design scope, not algorithmic superiority.
 
 \paragraph{BLAS~1 scaling.}
 At single-thread, AVX2 contributes 4--9$\times$ speedup for reduction operations (latency hiding via multiple accumulators) and 0--1$\times$ for bandwidth-limited operations. Adding 8-thread OpenMP yields an additional 7--8$\times$ improvement, resulting in combined speedups of 30--70$\times$ over the scalar baseline for reduction-heavy kernels. At 20 threads on the full machine, some kernels scale sublinearly (ssymv reaches only 13.35\,GB/s at 16T, likely due to NUMA effects), while others like sscal exceed the DDR4 sustained bandwidth limit (134.4\,GB/s on 8T, $\sim 7 \times$ single-thread).
